@@ -36,6 +36,7 @@ capture service runs wherever there is CPU to spare and reaches it over HTTPS.
 | ✅ | publishing the summary and the transcript into the room |
 | ✅ | the announcement at the start of a call, and `!без-записи` / `!запись` for room admins |
 | ✅ | both call formats: the `org.matrix.msc3401.call.member` state events Element Call sends today, and the MatrixRTC `m.rtc.member` sticky events (MSC4143, MSC4354) it is moving to |
+| ✅ | telling the gateway who is in the room, so an archive can file the meeting for each of them |
 
 Calls in rooms without the bot — direct calls included — are never looked at.
 An encrypted room is reported in the log: the bot cannot hear an encrypted call
@@ -83,10 +84,24 @@ Nextcloud; the rest of the analysis stays on the gateway.
 - Nothing is posted twice: every file is recorded once it is in the room, and a
   restart, a failed upload or a lost acknowledgement resumes from there.
 - Meetings this service lost track of are taken back from the gateway
-  (`/v1/meetings/undelivered?source=element-call`). The gateway key may be
-  shared with the Nextcloud app; each integration takes only its own platform's
-  meetings.
+  (`/v1/meetings/undelivered?source=element-call&consumer=matrix`). The gateway
+  key may be shared with the Nextcloud app; each integration takes only its own
+  platform's meetings, and acknowledges them under its own name (`matrix`), so
+  an archive collecting the same meetings still gets them.
 - A room that removed the bot is not retried; the files stay on the gateway.
+
+## Who the meeting belongs to
+
+When a call starts, and again when it ends, the gateway is told who is in the
+room — every joined member but the bot, as Matrix ids with display names
+(`PUT /v1/meetings/{id}/audience`). An archive that files meetings for each of
+its people, such as the Nextcloud app, gets back the logins of those it can
+match. The matching is the gateway's, by rules the tenant's owner sets there;
+this service hands over ids as they are and knows nothing about the archive.
+
+The room, not just the people who joined the call: the room sees the results
+anyway, and someone who missed the meeting is who most needs them. A gateway
+that cannot be reached is asked again on later ticks for an hour.
 
 ## Running it
 

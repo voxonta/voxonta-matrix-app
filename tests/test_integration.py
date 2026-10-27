@@ -18,6 +18,7 @@ from conftest import (
     SERVER,
     T0,
     Clock,
+    FakeGateway,
     FakeMatrix,
     device,
     make_config,
@@ -26,7 +27,7 @@ from conftest import (
     rtc_device,
 )
 
-from voxonta_matrix.integration import Integration, TryAgain
+from voxonta_matrix.integration import AUDIENCE_RETRY_S, Integration, TryAgain
 from voxonta_matrix.matrix import MatrixError
 from voxonta_matrix.rtc import _hash, livekit_room
 from voxonta_matrix.store import MemoryStore
@@ -46,7 +47,9 @@ class Setup:
         self.clock = clock or Clock()
         self.store = store or MemoryStore()
         self.matrix = FakeMatrix(daily_room() if state is None else state, timeline)
-        self.integration = Integration(make_config(), self.store, self.matrix, clock=self.clock)
+        self.gateway = FakeGateway()
+        self.integration = Integration(make_config(), self.store, self.matrix,
+                                       clock=self.clock, gateway=self.gateway)
         self._txn = 0
 
     async def start(self) -> Setup:
@@ -451,3 +454,63 @@ def test_a_bot_invited_into_a_running_matrixrtc_call_sees_it():
 
     [call] = run(go()).listing()
     assert call["token"] == "!new:example.org"
+
+
+# ── who was in the room ───────────────────────────────────────────────
+
+DAILY = [{"id": ALICE, "name": "Алиса"}, {"id": BOB, "name": "Боб"}, {"id": CAROL, "name": ""}]
+
+
+def test_the_gateway_hears_who_is_in_the_room_when_the_call_starts_and_ends():
+    async def go():
+        s = await Setup().start()
+        await s.send(device(ALICE, "LAPTOP"))
+        # Not while the homeserver waits on the transaction: on the next tick.
+        during_transaction = list(s.gateway.audiences)
+        await s.after(0)
+        sid = s.listing()[0]["session_id"]
+        dave = f"@dave:{SERVER}"
+        await s.send(member(dave, name="Дейв"), device(ALICE, "LAPTOP", left=True))
+        await s.after(make_config().call_end_grace_s + 1)
+        return during_transaction, s.gateway.audiences, sid, dave
+
+    during_transaction, audiences, sid, dave = run(go())
+    assert during_transaction == []
+    # Everyone in the room, not only who joined the call, and never the bot:
+    # the room sees the results, so the room is who they belong to.
+    assert audiences == [(sid, DAILY), (sid, sorted(DAILY + [{"id": dave, "name": "Дейв"}],
+                                                    key=lambda p: p["id"]))]
+
+
+def test_a_gateway_that_was_down_is_told_once_it_is_back():
+    async def go():
+        s = await Setup().start()
+        s.gateway.down = True
+        await s.send(device(ALICE, "LAPTOP"))
+        await s.after(0)
+        await s.after(5)
+        s.gateway.down = False
+        await s.after(5)
+        await s.after(5)
+        return s.listing()[0]["session_id"], s.gateway.audiences
+
+    sid, audiences = run(go())
+    assert audiences == [(sid, DAILY)]
+
+
+def test_a_gateway_down_for_an_hour_is_given_up_on_once(caplog):
+    async def go():
+        s = await Setup().start()
+        s.gateway.down = True
+        await s.send(device(ALICE, "LAPTOP"))
+        await s.after(0)
+        await s.after(AUDIENCE_RETRY_S)
+        await s.after(5)
+        s.gateway.down = False
+        await s.after(5)
+        return s.gateway.audiences
+
+    # The gateway still has the call's roster, by name, to share by.
+    assert run(go()) == []
+    assert len([r for r in caplog.records
+                if "gave up telling the gateway" in r.getMessage()]) == 1

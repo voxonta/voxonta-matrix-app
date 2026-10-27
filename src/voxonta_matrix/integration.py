@@ -14,7 +14,10 @@ The same job the Nextcloud app does for Talk, on Matrix:
 * the room is told when a call is being transcribed, and nothing is recorded
   until it has been: the bot is invisible in the call, so the message is the
   only way anyone knows. A room administrator can stop it with !без-записи and
-  resume it with !запись, for the rest of the call.
+  resume it with !запись, for the rest of the call;
+* the gateway is told who is in the room — when the call starts and again when
+  it ends — so the archive can file the meeting for each of them. Matrix ids as
+  they are: matching them to archive accounts is the gateway's job.
 
 The capture service learns all of this from `calls()`, which it polls.
 """
@@ -43,6 +46,9 @@ TXN_MEMORY_S = 24 * 3600
 # An announcement that cannot be posted is retried every tick, and said in the
 # log this often: the call it belongs to is not being recorded meanwhile.
 ANNOUNCE_WARN_EVERY_S = 600
+# How long telling the gateway who was in a room is retried. After that the
+# gateway still has the call's own roster, by name, to go on.
+AUDIENCE_RETRY_S = 3600
 
 
 class TryAgain(Exception):
@@ -58,10 +64,11 @@ def _transient(e: Exception) -> bool:
 
 
 class Integration:
-    def __init__(self, config, store, matrix, clock=time.time) -> None:
+    def __init__(self, config, store, matrix, clock=time.time, gateway=None) -> None:
         self.config = config
         self.store = store
         self.matrix = matrix
+        self.gateway = gateway
         self._clock = clock
         self.bot = config.bot_user_id
         self.rooms: dict[str, Room] = {}
@@ -69,6 +76,9 @@ class Integration:
         # Rooms that said !без-записи with no call on; it holds their next call.
         self.opt_outs: set[str] = set()
         self._announce_warned: dict[str, float] = {}
+        # Who is in each call's room, waiting to be told to the gateway:
+        # session id → (people, when it was first due).
+        self._audience: dict[str, tuple[list[dict], float]] = {}
         # Transactions and the periodic check both change calls; one at a time.
         self._lock = asyncio.Lock()
         # Set once start() has read the rooms. The listeners are up before
@@ -231,6 +241,9 @@ class Integration:
         async with self._lock:
             await self._reconcile()
         await self._announce()
+        # Here and not after each transaction: the gateway is another service,
+        # and the homeserver should not wait on it.
+        await self._report_audience()
 
     async def _reconcile(self) -> None:
         now = self._clock()
@@ -257,6 +270,7 @@ class Integration:
                 logger.info("call started in %s (%s) [%s]%s",
                             room.display_name(self.bot), room_id, call.session_id[:8],
                             ", not recorded: the room opted out beforehand" if consumed else "")
+                self._queue_audience(call.session_id, room, now)
             if call.empty_since is not None:
                 call.empty_since = None
                 changed = True
@@ -282,11 +296,40 @@ class Integration:
 
     async def _end(self, call: Call, room: Room | None, now: float) -> None:
         name = room.display_name(self.bot) if room is not None else call.room_id
+        if room is not None:
+            # The room as it is at the end: whoever joined during the call too.
+            self._queue_audience(call.session_id, room, now)
         await self.store.end_call(call, Meeting(call.session_id, call.room_id, name,
                                                 call.started_at, int(now)))
         del self.calls[call.room_id]
         logger.info("call ended in %s (%s) [%s] after %d min", name, call.room_id,
                     call.session_id[:8], (int(now) - call.started_at) // 60)
+
+    # ── telling the gateway who was there ─────────────────────────────
+
+    def _queue_audience(self, session_id: str, room: Room, now: float) -> None:
+        people = [{"id": user, "name": room.members.get(user, "")}
+                  for user in room.people(self.bot)]
+        since = self._audience.get(session_id, (None, now))[1]
+        self._audience[session_id] = (people, since)
+
+    async def _report_audience(self) -> None:
+        """Send what is waiting. A failure is retried on later ticks, for a while."""
+        if self.gateway is None:
+            return
+        async with self._lock:
+            due = list(self._audience.items())
+        for session_id, (people, since) in due:
+            sent = await self.gateway.audience(session_id, people)
+            async with self._lock:
+                if self._audience.get(session_id, (None,))[0] is not people:
+                    continue  # replaced meanwhile: the newer list goes next tick
+                if sent:
+                    del self._audience[session_id]
+                elif self._clock() - since >= AUDIENCE_RETRY_S:
+                    del self._audience[session_id]
+                    logger.warning("gave up telling the gateway who is in [%s]; the "
+                                   "archive will go by the call's roster", session_id[:8])
 
     # ── telling the room ──────────────────────────────────────────────
 

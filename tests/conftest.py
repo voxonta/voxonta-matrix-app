@@ -143,6 +143,7 @@ class FakeGateway:
         self.down = False
         self.corrupt: set[str] = set()      # digests that arrive damaged
         self.asked: list[str] = []
+        self.audiences: list[tuple[str, list[dict]]] = []
 
     def put(self, session_id: str, status: str, files: dict[str, tuple[str, bytes]] | None = None,
             detail: str = "") -> None:
@@ -175,6 +176,12 @@ class FakeGateway:
 
     async def ack(self, session_id: str, digests: list[str]) -> None:
         self.acked.append((session_id, list(digests)))
+
+    async def audience(self, session_id: str, people: list[dict]) -> bool:
+        if self.down:
+            return False
+        self.audiences.append((session_id, [dict(p) for p in people]))
+        return True
 
 
 def member(user: str, membership: str = "join", name: str = "", *,

@@ -55,9 +55,10 @@ async def run(config: Config) -> None:
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
         matrix = MatrixClient(config.homeserver_url, config.as_token,
                               config.bot_user_id, session)
-        integration = Integration(config, store, matrix)
+        gateway = GatewayClient(config.gateway_url, config.gateway_token, session)
+        integration = Integration(config, store, matrix, gateway=gateway)
         delivery = Delivery(
-            store, GatewayClient(config.gateway_url, config.gateway_token, session), matrix,
+            store, gateway, matrix,
             is_live=lambda sid: any(c.session_id == sid for c in integration.calls.values()))
         # Listen before reading the rooms: the homeserver may already be
         # retrying transactions, and those wait until start() is done rather
