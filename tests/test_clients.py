@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 from urllib.parse import unquote
 
 import aiohttp
@@ -65,10 +66,16 @@ def gateway_routes(*, damaged=False):
     async def ack(request):
         return web.json_response({"acked": len((await request.json())["sha256"])})
 
+    async def audience(request):
+        if request.match_info["sid"] != SID:
+            return web.json_response({"error": "unknown meeting"}, status=404)
+        return web.json_response({"people": len((await request.json())["people"])})
+
     return [web.get("/v1/meetings/undelivered", undelivered),
             web.get("/v1/meetings/{sid}", meeting),
             web.get("/v1/meetings/{sid}/artifacts/{sha}", artifact),
-            web.post("/v1/meetings/{sid}/ack", ack)]
+            web.post("/v1/meetings/{sid}/ack", ack),
+            web.put("/v1/meetings/{sid}/audience", audience)]
 
 
 def test_the_gateway_is_asked_like_the_nextcloud_app_asks_it():
@@ -82,10 +89,12 @@ def test_the_gateway_is_asked_like_the_nextcloud_app_asks_it():
             body = await gw.artifact(SID, SHA)
             rows = await gw.undelivered(["element-call", ""])
             await gw.ack(SID, [SHA])
+            told = await gw.audience(SID, [{"id": "@alice:x.org", "name": "Алиса"}])
+            refused = await gw.audience("other", [])
         await server.close()
-        return state, body, rows
+        return state, body, rows, (told, refused)
 
-    state, body, rows = run(go())
+    state, body, rows, audience = run(go())
     assert (state.status, state.final) == ("complete", True)
     assert [(a.name, a.kind, a.sha256) for a in state.artifacts] == [
         ("2026-10-27 - Дейли.md", "transcript", SHA)]
@@ -96,9 +105,17 @@ def test_the_gateway_is_asked_like_the_nextcloud_app_asks_it():
     assert paths == [("GET", f"/v1/meetings/{SID}"),
                      ("GET", f"/v1/meetings/{SID}/artifacts/{SHA}"),
                      # Repeated, not source[]=: the gateway reads it that way.
-                     ("GET", "/v1/meetings/undelivered?source=element-call&source="),
-                     ("POST", f"/v1/meetings/{SID}/ack")]
-    assert seen[-1][3] == b'{"sha256": ["' + SHA.encode() + b'"]}'
+                     # Under its own name: the archive collects the same meetings.
+                     ("GET", ("/v1/meetings/undelivered"
+                              "?source=element-call&source=&consumer=matrix")),
+                     ("POST", f"/v1/meetings/{SID}/ack"),
+                     ("PUT", f"/v1/meetings/{SID}/audience"),
+                     ("PUT", "/v1/meetings/other/audience")]
+    assert json.loads(seen[3][3]) == {"sha256": [SHA], "consumer": "matrix"}
+    # Matrix ids as they are; matching them to accounts is the gateway's job.
+    assert json.loads(seen[4][3]) == {
+        "platform": "matrix", "people": [{"id": "@alice:x.org", "name": "Алиса"}]}
+    assert audience == (True, False)
 
 
 def test_an_unknown_meeting_is_told_apart_from_a_gateway_that_is_down():
@@ -113,6 +130,7 @@ def test_an_unknown_meeting_is_told_apart_from_a_gateway_that_is_down():
                 await gw.meeting(SID)
             assert await gw.undelivered(["element-call"]) == []
             await gw.ack(SID, [SHA])   # advisory: does not raise
+            assert await gw.audience(SID, []) is False
 
     run(go())
 

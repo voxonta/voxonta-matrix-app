@@ -5,6 +5,10 @@ gateway's HTTP API: a meeting's status and file list, one file by its digest,
 the meetings still holding files nobody took, and the acknowledgement that
 lets the gateway retire them. The key is the installation's gateway key; it
 decides whose meetings these are.
+
+And one the Nextcloud app does not: who was in the room. The archive that
+files the meeting for each of its people knows nothing about Matrix; the
+gateway matches these ids to the archive's accounts.
 """
 from __future__ import annotations
 
@@ -16,6 +20,12 @@ from urllib.parse import quote
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# The name this integration's receipts are kept under. The archive collects the
+# same meetings under its own, and neither taking them hides them from the other.
+CONSUMER = "matrix"
+# How the gateway is told whose ids these are.
+PLATFORM = "matrix"
 
 
 class GatewayUnavailable(Exception):
@@ -86,13 +96,15 @@ class GatewayClient:
         return content
 
     async def undelivered(self, sources: list[str]) -> list[dict]:
-        """Meetings of these platforms with files not yet acknowledged.
+        """Meetings of these platforms with files this integration has not
+        acknowledged.
 
         Empty when the gateway cannot be asked: a sweep that fails is one that
         runs again in a minute, not a reason to stop anything else.
         """
         try:
-            resp = await self._get("/undelivered", params=[("source", s) for s in sources])
+            resp = await self._get("/undelivered", params=[
+                *(("source", s) for s in sources), ("consumer", CONSUMER)])
             if resp.status != 200:
                 raise GatewayUnavailable(f"HTTP {resp.status}")
             body = await resp.json()
@@ -109,8 +121,28 @@ class GatewayClient:
         try:
             async with self._session.post(
                     f"{self._base}/{quote(session_id, safe='')}/ack",
-                    json={"sha256": digests}, headers=self._headers) as resp:
+                    json={"sha256": digests, "consumer": CONSUMER},
+                    headers=self._headers) as resp:
                 if resp.status != 200:
                     logger.info("ack of %s answered HTTP %d", session_id[:8], resp.status)
         except (TimeoutError, aiohttp.ClientError) as e:
             logger.info("could not acknowledge %s: %s", session_id[:8], e)
+
+    async def audience(self, session_id: str, people: list[dict]) -> bool:
+        """Tell the gateway who is in the call's room. True once it has it.
+
+        `people` are {"id": Matrix id, "name": display name}. Each report
+        replaces the last, so the one sent when the call ends is what counts.
+        """
+        try:
+            async with self._session.put(
+                    f"{self._base}/{quote(session_id, safe='')}/audience",
+                    json={"platform": PLATFORM, "people": people},
+                    headers=self._headers) as resp:
+                if resp.status == 200:
+                    return True
+                logger.info("the gateway took no audience for %s: HTTP %d",
+                            session_id[:8], resp.status)
+        except (TimeoutError, aiohttp.ClientError) as e:
+            logger.info("could not tell the gateway who is in %s: %s", session_id[:8], e)
+        return False
