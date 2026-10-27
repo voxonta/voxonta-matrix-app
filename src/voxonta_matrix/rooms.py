@@ -23,6 +23,10 @@ logger = logging.getLogger(__name__)
 ROOM_ONE_TO_ONE = 1
 ROOM_GROUP = 2
 
+# Who may stop and resume recording: a room administrator, as Element labels
+# power level 100.
+ADMIN_LEVEL = 100
+
 
 @dataclass
 class Room:
@@ -34,6 +38,12 @@ class Room:
     # Devices in the call, by the state key of their membership event.
     memberships: dict[str, Membership] = field(default_factory=dict)
     encrypted: bool = False
+    # From m.room.create: who made the room, and its version.
+    creators: set[str] = field(default_factory=set)
+    version: str = "1"
+    # From m.room.power_levels; None until the room has one.
+    power_users: dict[str, int] | None = None
+    power_default: int = 0
     # Formats already reported for this room, so a busy call logs it once.
     _reported: set[str] = field(default_factory=set)
 
@@ -54,6 +64,15 @@ class Room:
                 self.members[key] = str(content.get("displayname") or "")
             else:
                 self.members.pop(key, None)
+        elif etype == "m.room.create":
+            self.version = str(content.get("room_version") or "1")
+            extra = content.get("additional_creators")
+            self.creators = {str(event.get("sender") or "")} | (
+                {str(u) for u in extra} if isinstance(extra, list) else set())
+        elif etype == "m.room.power_levels":
+            users = content.get("users") if isinstance(content.get("users"), dict) else {}
+            self.power_users = {str(u): _level(v) for u, v in users.items()}
+            self.power_default = _level(content.get("users_default"))
         elif etype == "m.room.encryption":
             if not self.encrypted:
                 # Not a formality: an encrypted call is one the bot cannot hear.
@@ -96,6 +115,35 @@ class Room:
             return ", ".join(self.name_of(u) for u in people[:3])
         return self.room_id
 
+    def is_admin(self, user_id: str) -> bool:
+        """Whether this person is a room administrator.
+
+        Power level 100 or more. In room version 12 and later the creators
+        stand above the power levels and are not listed in them at all; in
+        any room without a power levels event the creator is the one with 100.
+        """
+        if user_id in self.creators and (_creators_privileged(self.version)
+                                         or self.power_users is None):
+            return True
+        if self.power_users is None:
+            return False
+        return self.power_users.get(user_id, self.power_default) >= ADMIN_LEVEL
+
     def kind(self, bot_user_id: str) -> int:
         """One-to-one when two people (the bot not counted) are in the room."""
         return ROOM_ONE_TO_ONE if len(self.people(bot_user_id)) <= 2 else ROOM_GROUP
+
+
+def _level(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _creators_privileged(version: str) -> bool:
+    """Room version 12 made creators unconditionally all-powerful."""
+    try:
+        return int(version) >= 12
+    except ValueError:
+        return False

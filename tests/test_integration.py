@@ -111,16 +111,19 @@ def test_a_call_shows_up_as_soon_as_someone_joins_it():
     async def go():
         s = await Setup().start()
         await s.send(device(ALICE, "LAPTOP"))
-        return s
+        before = s.listing()
+        await s.after(0)   # the timer tick that announces it
+        return before, s.listing()
 
-    [call] = run(go()).listing()
+    [before], [call] = run(go())
     assert call["token"] == ROOM
     assert call["name"] == "Дейли"
     assert call["type"] == 2
     assert call["started_at"] == int(T0)
     assert call["platform"] == "livekit"
-    assert call["recording"] is True
     assert uuid.UUID(call["session_id"]).version == 4
+    # Listed at once, so the capture service joins; recorded once the room is told.
+    assert (before["recording"], call["recording"]) == (False, True)
 
 
 def test_the_capture_service_gets_a_listen_only_token_for_this_room():

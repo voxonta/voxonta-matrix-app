@@ -34,11 +34,32 @@ capture service runs wherever there is CPU to spare and reaches it over HTTPS.
 | ✅ | `/calls` for the capture service: the room, a session id kept across restarts, a listen-only LiveKit token, and every LiveKit identity mapped to its person |
 | ✅ | the capture service's LiveKit driver (nextcloud-talk-capture, `[livekit]` extra) |
 | ✅ | publishing the summary and the transcript into the room |
-| ⏳ | the announcement at the start of a call, and `!no-record` / `!record` for room admins |
+| ✅ | the announcement at the start of a call, and `!без-записи` / `!запись` for room admins |
 | ⏳ | `m.rtc.member` (MSC4143) memberships — reported in the log until then |
 
 Calls in rooms without the bot — direct calls included — are never looked at.
 An encrypted room is reported in the log: the bot cannot hear an encrypted call.
+
+## During a call
+
+The bot is not visible in the call, so it says so in the room: **«Идёт
+расшифровка звонка. Администратор комнаты может остановить её командой
+!без-записи.»** Nothing is recorded before that message is posted — if the bot
+may not write in the room, the call is not recorded, and the log says why.
+
+| Command | |
+|---|---|
+| `!без-записи` (`!no-record`, `!no-transcribe`) | stop recording for the rest of the call |
+| `!запись` (`!record`, `!transcribe`) | resume it |
+
+- Only a room administrator — power level 100, or a room creator in room
+  version 12 — can use them; anyone else is told so and nothing changes.
+- The `/` spellings work too, as in Talk, but Element takes `/…` for its own
+  commands, so `!` is what to type.
+- Typed when there is no call, `!без-записи` holds the next call in the room;
+  that call starts with a message saying it is not transcribed.
+- The change is stored before the bot confirms it, and the capture service
+  stops sending audio within one poll (five seconds).
 
 ## Results in the room
 

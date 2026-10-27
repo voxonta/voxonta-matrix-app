@@ -10,7 +10,11 @@ The same job the Nextcloud app does for Talk, on Matrix:
   from laptop to phone, briefly leaves the room empty; ending the call there
   would cut the meeting in two;
 * each call gets a session id when it starts and keeps it until it ends, across
-  restarts of this service. The capture service streams under it.
+  restarts of this service. The capture service streams under it;
+* the room is told when a call is being transcribed, and nothing is recorded
+  until it has been: the bot is invisible in the call, so the message is the
+  only way anyone knows. A room administrator can stop it with !без-записи and
+  resume it with !запись, for the rest of the call.
 
 The capture service learns all of this from `calls()`, which it polls.
 """
@@ -23,6 +27,8 @@ import uuid
 
 import aiohttp
 
+from voxonta_matrix import commands
+from voxonta_matrix.commands import command_in, notice
 from voxonta_matrix.livekit import capture_token
 from voxonta_matrix.matrix import MatrixError
 from voxonta_matrix.rooms import Room
@@ -34,6 +40,9 @@ logger = logging.getLogger(__name__)
 # Transactions are remembered for a day: the homeserver retries a failed one
 # within minutes, never a day later.
 TXN_MEMORY_S = 24 * 3600
+# An announcement that cannot be posted is retried every tick, and said in the
+# log this often: the call it belongs to is not being recorded meanwhile.
+ANNOUNCE_WARN_EVERY_S = 600
 
 
 class TryAgain(Exception):
@@ -57,6 +66,9 @@ class Integration:
         self.bot = config.bot_user_id
         self.rooms: dict[str, Room] = {}
         self.calls: dict[str, Call] = {}
+        # Rooms that said !без-записи with no call on; it holds their next call.
+        self.opt_outs: set[str] = set()
+        self._announce_warned: dict[str, float] = {}
         # Transactions and the periodic check both change calls; one at a time.
         self._lock = asyncio.Lock()
         # Set once start() has read the rooms. The listeners are up before
@@ -77,6 +89,7 @@ class Integration:
         async with self._lock:
             await self.matrix.ensure_bot(self.config.bot_displayname)
             self.calls = {c.room_id: c for c in await self.store.load_calls()}
+            self.opt_outs = await self.store.load_opt_outs()
             for room_id in await self.matrix.joined_rooms():
                 try:
                     await self._read_room(room_id)
@@ -141,8 +154,13 @@ class Integration:
             await self._on_bot_membership(room_id, event)
             return
         room = self.rooms.get(room_id)
-        if room is not None:
-            room.apply(event)
+        if room is None:
+            return
+        action = command_in(event)
+        if action is not None and event.get("sender") != self.bot:
+            await self._on_command(room, event, action)
+            return
+        room.apply(event)
 
     async def _on_bot_membership(self, room_id: str, event: dict) -> None:
         membership = (event.get("content") or {}).get("membership")
@@ -189,6 +207,7 @@ class Integration:
         await self._ready.wait()
         async with self._lock:
             await self._reconcile()
+        await self._announce()
 
     async def _reconcile(self) -> None:
         now = self._clock()
@@ -206,13 +225,15 @@ class Integration:
                     await self._end(call, room, now)
                 continue
 
-            changed = False
+            changed = consumed = False
             if call is None:
-                call = Call(room_id, str(uuid.uuid4()), int(now))
+                consumed = room_id in self.opt_outs
+                call = Call(room_id, str(uuid.uuid4()), int(now), recording=not consumed)
                 self.calls[room_id] = call
                 changed = True
-                logger.info("call started in %s (%s) [%s]",
-                            room.display_name(self.bot), room_id, call.session_id[:8])
+                logger.info("call started in %s (%s) [%s]%s",
+                            room.display_name(self.bot), room_id, call.session_id[:8],
+                            ", not recorded: the room opted out beforehand" if consumed else "")
             if call.empty_since is not None:
                 call.empty_since = None
                 changed = True
@@ -225,6 +246,12 @@ class Integration:
                         changed = True
             if changed:
                 await self.store.save_call(call)
+            if consumed:
+                # Used up by this call, after the call is saved: a crash in
+                # between leaves it for the next call too, which errs the
+                # right way.
+                await self.store.set_opt_out(room_id, False, now)
+                self.opt_outs.discard(room_id)
 
         # Rooms the bot has left: whatever was being captured there is over.
         for room_id in [r for r in self.calls if r not in self.rooms]:
@@ -237,6 +264,92 @@ class Integration:
         del self.calls[call.room_id]
         logger.info("call ended in %s (%s) [%s] after %d min", name, call.room_id,
                     call.session_id[:8], (int(now) - call.started_at) // 60)
+
+    # ── telling the room ──────────────────────────────────────────────
+
+    async def _announce(self) -> None:
+        """Tell each room whose call has started that it is being transcribed.
+
+        Outside the lock: posting is a network round trip, and transactions
+        should not wait for it. The call is marked announced only after the
+        homeserver has the message; until then /calls says it is not to be
+        recorded. The transaction id is the session's, so a retry after a
+        lost answer is the same message, not a second one.
+        """
+        async with self._lock:
+            due = [(c.room_id, c.session_id, c.recording)
+                   for c in self.calls.values() if not c.announced]
+        for room_id, session_id, recording in due:
+            text = commands.ANNOUNCE if recording else commands.ANNOUNCE_OPTED_OUT
+            try:
+                await self.matrix.send(room_id, notice(text),
+                                       txn_id=f"voxonta.{session_id}.start")
+            except (MatrixError, aiohttp.ClientError, TimeoutError) as e:
+                now = self._clock()
+                if now - self._announce_warned.get(session_id, 0.0) >= ANNOUNCE_WARN_EVERY_S:
+                    self._announce_warned[session_id] = now
+                    logger.warning("cannot tell %s that its call is transcribed, so it is "
+                                   "not being recorded [%s]: %s", room_id, session_id[:8], e)
+                continue
+            async with self._lock:
+                call = self.calls.get(room_id)
+                if call is not None and call.session_id == session_id and not call.announced:
+                    call.announced = True
+                    await self.store.save_call(call)
+            self._announce_warned.pop(session_id, None)
+            logger.info("announced the call in %s [%s]", room_id, session_id[:8])
+
+    async def _on_command(self, room: Room, event: dict, action: str) -> None:
+        """!без-записи or !запись from someone in the room.
+
+        Only an administrator changes anything. The new state is stored
+        before the answer is posted: a room told recording has stopped while
+        it has not is the one order of events this must never produce. If
+        storing fails, the answer says so.
+        """
+        stop = action == commands.STOP
+        sender = str(event.get("sender") or "")
+        if not room.is_admin(sender):
+            await self._answer(room.room_id, event, commands.ONLY_ADMIN_STOPS if stop
+                               else commands.ONLY_ADMIN_RESUMES)
+            return
+        call = self.calls.get(room.room_id)
+        try:
+            if call is not None:
+                if call.recording == stop:
+                    call.recording = not stop
+                    try:
+                        await self.store.save_call(call)
+                    except Exception:
+                        call.recording = stop
+                        raise
+                text = commands.STOPPED if stop else commands.RESUMED
+            else:
+                await self.store.set_opt_out(room.room_id, stop, self._clock())
+                (self.opt_outs.add if stop else self.opt_outs.discard)(room.room_id)
+                text = commands.STOPPED_NEXT if stop else commands.RESUMED_NEXT
+        except Exception:
+            logger.exception("could not apply %s in %s", action, room.room_id)
+            await self._answer(room.room_id, event, commands.COULD_NOT_STOP if stop
+                               else commands.COULD_NOT_RESUME)
+            return
+        logger.info("%s %s recording in %s%s", sender, "stopped" if stop else "resumed",
+                    room.room_id, "" if call is not None else " (for the next call)")
+        await self._answer(room.room_id, event, text)
+
+    async def _answer(self, room_id: str, event: dict, text: str) -> None:
+        """Reply to a command. A transient failure leaves the transaction
+        unacknowledged: the homeserver sends it again, the command is applied
+        again (which changes nothing), and the reply goes out under the same
+        transaction id — once."""
+        event_id = str(event.get("event_id") or "")
+        try:
+            await self.matrix.send(room_id, notice(text, reply_to=event_id or None),
+                                   txn_id=f"voxonta.reply.{event_id}")
+        except Exception as e:
+            if _transient(e):
+                raise TryAgain() from e
+            logger.warning("could not answer in %s: %s", room_id, e)
 
     # ── what the capture service sees ─────────────────────────────────
 
@@ -261,7 +374,8 @@ class Integration:
                 "type": room.kind(self.bot),
                 "started_at": call.started_at,
                 "session_id": call.session_id,
-                "recording": call.recording,
+                # Not before the room has been told.
+                "recording": call.recording and call.announced,
                 "platform": "livekit",
                 "livekit": {
                     "url": self.config.livekit_url,
