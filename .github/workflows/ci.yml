@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    services:
+      # The store's Postgres half is the one a deployment runs; it is tested
+      # here rather than assumed from the memory store passing.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      # The capture service from its main branch, for the test that polls this
+      # service with its own client: the two are released separately, and
+      # drifting apart is exactly what that test is for.
+      - name: Install
+        run: |
+          pip install -e '.[dev]'
+          pip install 'nextcloud-talk-capture @ git+https://github.com/voxonta/nextcloud-talk-capture@main'
+
+      - name: Lint
+        run: ruff check src tests
+
+      - name: Test
+        env:
+          TEST_DATABASE_URL: postgresql://postgres:test@localhost:5432/postgres
+        run: python -m pytest tests -q -rs
+
+  image:
+    name: Image builds
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build
+        run: docker build -t voxonta-matrix-app:ci .
+      - name: Refuses to start half-configured
+        run: |
+          out=$(docker run --rm voxonta-matrix-app:ci 2>&1 || true)
+          echo "$out"
+          echo "$out" | grep -q "required but not set: MATRIX_HOMESERVER_URL"
