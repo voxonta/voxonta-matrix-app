@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxonta-matrix-app"
-version = "0.1.0"
+version = "0.2.0"
 description = "Voxonta for Matrix: transcribe Element Call meetings in rooms the bot is invited to"
 readme = "README.md"
 requires-python = ">=3.12"
