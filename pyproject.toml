@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "voxonta-matrix-app"
+version = "0.1.0"
+description = "Voxonta for Matrix: transcribe Element Call meetings in rooms the bot is invited to"
+readme = "README.md"
+requires-python = ">=3.12"
+# MIT, like the Nextcloud capture service it pairs with: this is an integration
+# customers run on their own homeserver, not a part of anything proprietary.
+license = { text = "MIT" }
+authors = [{ name = "Voxonta" }]
+keywords = ["matrix", "element-call", "livekit", "transcription", "appservice"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Communications :: Chat",
+    "Topic :: Communications :: Conferencing",
+]
+# HTTP both ways (Synapse in, the capture service in, Synapse out), Postgres
+# for what has to survive a restart, and a signed token for LiveKit.
+dependencies = [
+    "aiohttp>=3.9.0",
+    "psycopg[binary,pool]>=3.2",
+    "PyJWT>=2.8",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff>=0.6"]
+
+[project.scripts]
+voxonta-matrix-app = "voxonta_matrix.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/voxonta/voxonta-matrix-app"
+Issues = "https://github.com/voxonta/voxonta-matrix-app/issues"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["voxonta_matrix*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
