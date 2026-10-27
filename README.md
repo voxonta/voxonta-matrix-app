@@ -64,7 +64,7 @@ may not write in the room, the call is not recorded, and the log says why.
 - Typed when there is no call, `!без-записи` holds the next call in the room;
   that call starts with a message saying it is not transcribed.
 - The change is stored before the bot confirms it, and the capture service
-  stops sending audio within one poll (five seconds).
+  stops sending audio within one poll (`POLL_INTERVAL`, see below).
 
 ## Results in the room
 
@@ -153,8 +153,17 @@ nothing more.
 homeserver's network. `8081` is the capture service's API, at the same paths the
 Nextcloud app uses (`/apps/voxonta/api/v1/service/{config,calls,heartbeat}`), so
 one capture build serves both. Publish it behind TLS and allow only the capture
-service's address; point the capture service's `APP_BASE_URL` at it. `GET
-/healthz` on the same port is for monitoring.
+service's address; point the capture service's `APP_BASE_URL` at it.
+
+Set the capture service's `POLL_INTERVAL` to `1`. Nothing is recorded until the
+room has been told, and the bot tells it as soon as the homeserver reports the
+first device in the call — but the capture service only learns that on its
+next poll, so its default of five seconds loses up to five seconds of every
+call. A poll is answered from memory and costs next to nothing.
+
+`GET /healthz` on the same port is for monitoring. `capture_seen_s_ago` is the
+time since the capture service last polled or checked in; more than a few polls'
+worth means it has stopped asking.
 
 ## Development
 

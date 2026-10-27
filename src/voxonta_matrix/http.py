@@ -125,6 +125,9 @@ def service_app(integration, service_token: str, clock=time.time) -> web.Applica
     async def calls(request: web.Request) -> web.Response:
         if not authorized(request):
             return refuse()
+        # A poll is the capture service checking in too. The heartbeat alone
+        # comes once a minute, which made "not seen for 30 s" a false alarm.
+        seen["at"] = clock()
         return web.json_response({"calls": integration.calls_listing()})
 
     async def heartbeat(request: web.Request) -> web.Response:

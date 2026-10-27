@@ -149,17 +149,19 @@ def test_edits_notices_and_other_events_are_not_commands():
 
 # ── the announcement ──────────────────────────────────────────────────
 
-def test_the_call_is_announced_once_and_recorded_only_after():
+def test_the_call_is_announced_at_once_and_only_once():
     async def go():
         s = await Setup().start()
         await s.send(device(ALICE, "LAPTOP"))
-        before = s.recording()
+        at_once = s.recording(), s.said()
+        await s.send(device(BOB, "PHONE"))
         await s.tick()
         await s.tick(5)
-        return s, before
+        return s, at_once
 
-    s, before = run(go())
-    assert before is False and s.recording() is True
+    s, at_once = run(go())
+    # Told within the transaction that started the call, not on the next tick.
+    assert at_once == (True, [c.ANNOUNCE])
     assert s.said() == [c.ANNOUNCE]
     room, content, txn, _ = s.matrix.sent[0]
     sid = s.integration.calls_listing()[0]["session_id"]
@@ -197,7 +199,6 @@ def test_an_announcement_whose_answer_was_lost_is_not_posted_twice():
 
         s.matrix.send = answer_lost_once
         await s.send(device(ALICE, "LAPTOP"))
-        await s.tick()
         first = s.recording()
         await s.tick(5)
         return s, first

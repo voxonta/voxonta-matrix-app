@@ -139,6 +139,12 @@ class Integration:
         Raises TryAgain, leaving the transaction unacknowledged, when something
         failed that a later attempt can fix. The events before it are applied
         again then, which state allows.
+
+        A call this transaction started is announced before answering, not on
+        the next tick: nothing is recorded until the room has been told, and
+        waiting for the timer kept a call on 28.10 unrecorded for its first
+        4 s — it can be five. The homeserver holds its next transaction for
+        that one round trip, and only while a call waits to be announced.
         """
         await self._ready.wait()
         async with self._lock:
@@ -158,6 +164,7 @@ class Integration:
             now = self._clock()
             await self.store.mark_txn(txn_id, now)
             await self.store.prune_txns(now - TXN_MEMORY_S)
+        await self._announce()
 
     async def _on_event(self, event: dict) -> None:
         room_id = event.get("room_id")
