@@ -26,11 +26,14 @@ class Call:
     started_at: int  # unix seconds
     # When the last device left; the call ends once this is old enough.
     empty_since: float | None = None
-    # False while the room has opted out (a later stage); sent in /calls.
+    # False while the room has opted out (!без-записи); lasts until the call ends.
     recording: bool = True
     # Every LiveKit identity seen in this call → {"name", "user"}. Only grows:
     # someone who left still has to be named in the transcript.
     members: dict[str, dict[str, str]] = field(default_factory=dict)
+    # Whether the room has been told the call is transcribed. Nothing is
+    # recorded before it has: the bot is invisible in the call.
+    announced: bool = False
 
 
 @dataclass
@@ -62,6 +65,7 @@ class MemoryStore:
         self.calls: dict[str, Call] = {}
         self.meetings: dict[str, Meeting] = {}
         self.txns: dict[str, float] = {}
+        self.opt_outs: dict[str, float] = {}
 
     async def open(self) -> None:
         pass
@@ -104,6 +108,15 @@ class MemoryStore:
                     if m.done_at is not None and m.done_at < done_before]:
             del self.meetings[sid]
 
+    async def load_opt_outs(self) -> set[str]:
+        return set(self.opt_outs)
+
+    async def set_opt_out(self, room_id: str, opted_out: bool, now: float) -> None:
+        if opted_out:
+            self.opt_outs.setdefault(room_id, now)
+        else:
+            self.opt_outs.pop(room_id, None)
+
     async def txn_seen(self, txn_id: str) -> bool:
         return txn_id in self.txns
 
@@ -127,6 +140,12 @@ CREATE TABLE IF NOT EXISTS calls (
     empty_since DOUBLE PRECISION,
     recording   BOOLEAN NOT NULL DEFAULT TRUE,
     members     JSONB NOT NULL DEFAULT '{}'
+);
+ALTER TABLE calls ADD COLUMN IF NOT EXISTS announced BOOLEAN NOT NULL DEFAULT FALSE;
+-- Rooms that said !без-записи with no call on: it holds their next call.
+CREATE TABLE IF NOT EXISTS room_opt_outs (
+    room_id     TEXT PRIMARY KEY,
+    since       DOUBLE PRECISION NOT NULL
 );
 CREATE TABLE IF NOT EXISTS meetings (
     session_id  TEXT PRIMARY KEY,
@@ -154,7 +173,7 @@ _MEETING_COLUMNS = ("session_id, room_id, room_name, started_at, ended_at, misse
 
 class PostgresStore:
     """The same surface on Postgres. The schema is created on start: the role
-    owns its database and nothing else, and a migration tool for three tables
+    owns its database and nothing else, and a migration tool for four tables
     would be more to run than the tables themselves."""
 
     def __init__(self, dsn: str) -> None:
@@ -178,22 +197,24 @@ class PostgresStore:
     async def load_calls(self) -> list[Call]:
         async with self._pool.connection() as conn:
             rows = await (await conn.execute(
-                "SELECT room_id, session_id, started_at, empty_since, recording, members"
-                " FROM calls")).fetchall()
-        return [Call(r[0], r[1], int(r[2]), r[3], bool(r[4]), dict(r[5] or {}))
+                "SELECT room_id, session_id, started_at, empty_since, recording, members,"
+                "       announced FROM calls")).fetchall()
+        return [Call(r[0], r[1], int(r[2]), r[3], bool(r[4]), dict(r[5] or {}), bool(r[6]))
                 for r in rows]
 
     async def save_call(self, call: Call) -> None:
         async with self._pool.connection() as conn:
             await conn.execute(
                 "INSERT INTO calls (room_id, session_id, started_at, empty_since,"
-                "                   recording, members)"
-                " VALUES (%s, %s, %s, %s, %s, %s)"
+                "                   recording, members, announced)"
+                " VALUES (%s, %s, %s, %s, %s, %s, %s)"
                 " ON CONFLICT (room_id) DO UPDATE SET session_id = excluded.session_id,"
                 "   started_at = excluded.started_at, empty_since = excluded.empty_since,"
-                "   recording = excluded.recording, members = excluded.members",
+                "   recording = excluded.recording, members = excluded.members,"
+                "   announced = excluded.announced",
                 (call.room_id, call.session_id, call.started_at, call.empty_since,
-                 call.recording, json.dumps(call.members, ensure_ascii=False)))
+                 call.recording, json.dumps(call.members, ensure_ascii=False),
+                 call.announced))
 
     async def end_call(self, call: Call, meeting: Meeting) -> None:
         async with self._pool.connection() as conn, conn.transaction():
@@ -244,6 +265,20 @@ class PostgresStore:
     async def prune_meetings(self, done_before: float) -> None:
         async with self._pool.connection() as conn:
             await conn.execute("DELETE FROM meetings WHERE done_at < %s", (done_before,))
+
+    async def load_opt_outs(self) -> set[str]:
+        async with self._pool.connection() as conn:
+            rows = await (await conn.execute("SELECT room_id FROM room_opt_outs")).fetchall()
+        return {r[0] for r in rows}
+
+    async def set_opt_out(self, room_id: str, opted_out: bool, now: float) -> None:
+        async with self._pool.connection() as conn:
+            if opted_out:
+                await conn.execute(
+                    "INSERT INTO room_opt_outs (room_id, since) VALUES (%s, %s)"
+                    " ON CONFLICT (room_id) DO NOTHING", (room_id, now))
+            else:
+                await conn.execute("DELETE FROM room_opt_outs WHERE room_id = %s", (room_id,))
 
     async def txn_seen(self, txn_id: str) -> bool:
         async with self._pool.connection() as conn:

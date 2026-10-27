@@ -160,3 +160,60 @@ def test_a_meetings_table_from_before_publishing_gets_its_new_columns():
 
     meeting = run(go())
     assert (meeting.session_id, meeting.misses, meeting.published) == (sid, 0, ["c" * 64])
+
+
+def test_opt_outs_and_announcements_survive(make_store):
+    room = f"!{uuid.uuid4().hex}:example.org"
+    other = f"!{uuid.uuid4().hex}:example.org"
+
+    async def go():
+        store = make_store()
+        await store.open()
+        await store.set_opt_out(room, True, 100.0)
+        await store.set_opt_out(room, True, 200.0)    # said twice
+        await store.set_opt_out(other, True, 100.0)
+        await store.set_opt_out(other, False, 300.0)  # and taken back
+        opt_outs = await store.load_opt_outs()
+        await store.save_call(Call(room, str(uuid.uuid4()), 1000, recording=False,
+                                   announced=True))
+        [call] = [c for c in await store.load_calls() if c.room_id == room]
+        await store.set_opt_out(room, False, 400.0)
+        await store.close()
+        return opt_outs, call
+
+    opt_outs, call = run(go())
+    assert room in opt_outs and other not in opt_outs
+    assert (call.recording, call.announced) == (False, True)
+
+
+@pytest.mark.skipif(not _PG, reason="TEST_DATABASE_URL is not set")
+def test_a_calls_table_from_before_announcing_gets_its_column():
+    import psycopg
+
+    schema = f"s{uuid.uuid4().hex[:12]}"
+
+    async def go():
+        from voxonta_matrix.store import PostgresStore
+
+        with psycopg.connect(_PG, autocommit=True) as conn:
+            conn.execute(f"CREATE SCHEMA {schema}")
+            conn.execute(f"CREATE TABLE {schema}.calls (room_id TEXT PRIMARY KEY,"
+                         " session_id TEXT NOT NULL, started_at BIGINT NOT NULL,"
+                         " empty_since DOUBLE PRECISION,"
+                         " recording BOOLEAN NOT NULL DEFAULT TRUE,"
+                         " members JSONB NOT NULL DEFAULT '{}')")
+            conn.execute(f"INSERT INTO {schema}.calls (room_id, session_id, started_at)"
+                         " VALUES ('!r:x', 's', 1)")
+        sep = "&" if "?" in _PG else "?"
+        store = PostgresStore(f"{_PG}{sep}options=-csearch_path%3D{schema}")
+        try:
+            await store.open()
+            return await store.load_calls()
+        finally:
+            await store.close()
+            with psycopg.connect(_PG, autocommit=True) as conn:
+                conn.execute(f"DROP SCHEMA {schema} CASCADE")
+
+    [call] = run(go())
+    # A call from before this version has not been announced: it will be, once.
+    assert (call.room_id, call.announced) == ("!r:x", False)

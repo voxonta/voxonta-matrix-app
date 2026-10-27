@@ -40,6 +40,7 @@ def test_the_capture_service_sees_the_call_and_everything_it_needs():
             clock=clock)
         await integration.start()
         await integration.on_transaction("t1", [device(ALICE, "LAPTOP")])
+        await integration.reconcile()   # announces it, which lets it be recorded
 
         server = TestServer(service_app(integration, "service-token"))
         await server.start_server()
