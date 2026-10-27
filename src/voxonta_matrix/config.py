@@ -20,6 +20,8 @@ _REQUIRED = (
     "LIVEKIT_API_SECRET",
     "DATABASE_URL",
     "SERVICE_TOKEN",
+    "GATEWAY_URL",
+    "GATEWAY_TOKEN",
 )
 
 
@@ -52,6 +54,14 @@ class Config:
     # Shared secret for /apps/voxonta/api/v1/service/*; the same value is the
     # capture service's APP_SERVICE_TOKEN.
     service_token: str = ""
+
+    # ── The Voxonta gateway ──
+    # Its HTTP API, where finished meetings are collected from, and the
+    # installation's key — the same one the capture service streams with.
+    gateway_url: str = ""
+    gateway_token: str = ""
+    # How often to ask it about meetings that have ended, seconds.
+    collect_interval_s: float = 60.0
 
     # ── Listening ──
     appservice_port: int = 8080   # transactions from the homeserver
@@ -86,6 +96,9 @@ class Config:
             livekit_api_secret=env["LIVEKIT_API_SECRET"],
             database_url=env["DATABASE_URL"],
             service_token=env["SERVICE_TOKEN"],
+            gateway_url=env["GATEWAY_URL"].rstrip("/"),
+            gateway_token=env["GATEWAY_TOKEN"],
+            collect_interval_s=float(env.get("COLLECT_INTERVAL_S") or 60),
             appservice_port=int(env.get("APPSERVICE_PORT") or 8080),
             service_port=int(env.get("SERVICE_PORT") or 8081),
             call_end_grace_s=float(env.get("CALL_END_GRACE_S") or 90),

@@ -26,6 +26,7 @@ class MatrixClient:
     def __init__(self, homeserver_url: str, as_token: str, bot_user_id: str,
                  session: aiohttp.ClientSession) -> None:
         self._base = homeserver_url.rstrip("/") + "/_matrix/client/v3"
+        self._media = homeserver_url.rstrip("/") + "/_matrix/media/v3"
         self._headers = {"Authorization": f"Bearer {as_token}"}
         self.bot_user_id = bot_user_id
         self._session = session
@@ -33,16 +34,7 @@ class MatrixClient:
     async def _call(self, method: str, path: str, body: dict | None = None):
         async with self._session.request(method, self._base + path, json=body,
                                          headers=self._headers) as resp:
-            text = await resp.text()
-            try:
-                data = json.loads(text) if text else {}
-            except ValueError:
-                data = {}
-            if resp.status >= 400:
-                data = data if isinstance(data, dict) else {}
-                raise MatrixError(resp.status, str(data.get("errcode", "")),
-                                  str(data.get("error", "") or text[:200]))
-            return data
+            return await _answer(resp)
 
     async def ensure_bot(self, displayname: str) -> None:
         """Make sure the bot account exists and is called what it should be.
@@ -83,3 +75,40 @@ class MatrixClient:
     async def room_state(self, room_id: str) -> list[dict]:
         state = await self._call("GET", f"/rooms/{quote(room_id, safe='')}/state")
         return state if isinstance(state, list) else []
+
+    async def send(self, room_id: str, content: dict, txn_id: str) -> str:
+        """Post a message as the bot and return its event id.
+
+        The homeserver answers a repeated transaction id with the event it
+        already made, so a retry after a crash that lost the answer does not
+        post twice — for as long as the homeserver remembers the id (Synapse:
+        half an hour).
+        """
+        data = await self._call(
+            "PUT", f"/rooms/{quote(room_id, safe='')}/send/m.room.message/"
+                   f"{quote(txn_id, safe='')}", content)
+        return str(data.get("event_id") or "")
+
+    async def upload(self, data: bytes, filename: str, content_type: str) -> str:
+        """Store a file on the homeserver and return its mxc:// address."""
+        async with self._session.post(
+                self._media + "/upload", data=data, params={"filename": filename},
+                headers={**self._headers, "Content-Type": content_type}) as resp:
+            answer = await _answer(resp)
+        uri = str(answer.get("content_uri") or "")
+        if not uri.startswith("mxc://"):
+            raise MatrixError(resp.status, "", "upload answered without a content_uri")
+        return uri
+
+
+async def _answer(resp: aiohttp.ClientResponse):
+    text = await resp.text()
+    try:
+        data = json.loads(text) if text else {}
+    except ValueError:
+        data = {}
+    if resp.status >= 400:
+        data = data if isinstance(data, dict) else {}
+        raise MatrixError(resp.status, str(data.get("errcode", "")),
+                          str(data.get("error", "") or text[:200]))
+    return data
