@@ -1,8 +1,10 @@
-"""Reading Element Call out of room state: who is in a call, under which names.
+"""Reading Element Call out of a room: who is in a call, under which names.
 
-Element Call announces each device in a call with a state event in the room.
-The call itself is never an object anywhere — it is "the room has at least one
-live membership". Everything here is pure: events in, plain values out.
+Element Call announces each device in a call with an event in the room: a state
+event in the format clients send today, a sticky event (MSC4354) in the
+MatrixRTC format (MSC4143) they are moving to. The call itself is never an
+object anywhere — it is "the room has at least one live membership".
+Everything here is pure: events in, plain values out.
 
 Two names have to be worked out without asking anyone, because nothing hands
 them over:
@@ -13,6 +15,8 @@ them over:
   audio track. Clients have used three forms of it (below); which one a client
   uses is its business, so every form a membership could produce goes into the
   map, and the capture service just looks the track's identity up.
+
+Both names were checked against lk-jwt-service 0.9.0, which issues them.
 """
 from __future__ import annotations
 
@@ -24,12 +28,14 @@ from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
 
-# The per-device membership event Element Call sends today (MSC3401 lineage).
+# The per-device membership state event Element Call sends today (MSC3401 lineage).
 LEGACY_MEMBER = "org.matrix.msc3401.call.member"
-# MSC4143. Not seen on a real server yet; handled in a later stage. Until then
-# it is reported, not ignored silently: a client update can switch to it
-# overnight, and the symptom would otherwise be calls that simply never start.
+# MSC4143's sticky event, stable and unstable; matrix-js-sdk sends the latter.
 RTC_MEMBER_TYPES = ("m.rtc.member", "org.matrix.msc4143.rtc.member")
+
+# MSC4354: a sticky event stops counting at most an hour after it was sent.
+# Clients re-send their membership before then for as long as they stay.
+MAX_STICKY_MS = 3600 * 1000
 
 # A membership without its own `expires` lives this long — Element Call's
 # default. A device that vanishes without saying so stops counting after it.
@@ -74,13 +80,15 @@ class Membership:
     def identities(self) -> list[str]:
         """Every LiveKit identity this device may appear under.
 
-        `@user:server:DEVICE` is what clients send today; the two hashes are
-        what lk-jwt-service issues to clients that have moved to MSC4195 — the
-        newer one without the device, the legacy one with it. Unused forms cost
-        a map entry; a missing one costs a speaker nobody can name.
+        The three lk-jwt-service issues: `@user:server:DEVICE` from /sfu/get,
+        which clients use today; a hash with the device from its MSC4195
+        /get_token; one without from the homeserver's /rtc/livekit/get_token,
+        which MatrixRTC clients move to. Which one a client uses is its
+        business. Unused forms cost a map entry; a missing one costs a speaker
+        nobody can name.
         """
         return [
-            self.member_id,
+            f"{self.user_id}:{self.device_id}",
             _hash(self.user_id, self.device_id, self.member_id),
             _hash(self.user_id, self.member_id),
         ]
@@ -125,5 +133,98 @@ def parse_legacy_member(event: dict) -> Membership | None:
     return Membership(user_id, device_id, member_id, expires_at)
 
 
-def is_call_member_event(event_type: str) -> bool:
-    return event_type == LEGACY_MEMBER or event_type in RTC_MEMBER_TYPES
+@dataclass(frozen=True)
+class RtcEntry:
+    """One `m.rtc.member` sticky event, as an entry of the room's map.
+
+    MSC4354 makes these a map keyed by sender and `sticky_key`: of the events
+    under one key, the one its sender's server meant to expire last is the
+    device's current word, a later event id breaking a tie. That order, not
+    the order of arrival, decides — events from other servers come late.
+    """
+
+    key: tuple[str, str]
+    # origin_server_ts + sticky duration: what orders the events under a key.
+    intended_ms: int
+    event_id: str
+    # When this entry stops counting, on this side's clock.
+    expires_at_ms: int
+    # None when the device left, or is in something other than the room's call.
+    membership: Membership | None
+
+    def supersedes(self, other: RtcEntry) -> bool:
+        return (self.intended_ms, self.event_id) > (other.intended_ms, other.event_id)
+
+
+def parse_rtc_member(event: dict, now_ms: int) -> RtcEntry | None:
+    """The map entry an `m.rtc.member` event makes, read as matrix-js-sdk does.
+
+    None for an event that makes no entry — one without a sticky key. An entry
+    without a membership for a device that left: `member.membership` "leave",
+    or, from clients predating that field, nothing left of the content but the
+    slot and the key. Also without one for a membership that is not the
+    room-wide call over LiveKit, or that names someone other than its sender.
+
+    It stops counting when the homeserver says, in `unsigned`, how long it has
+    left; failing that, at the time its sender meant (MSC4354 caps both at an
+    hour). An event with no sticky duration at all is given the hour: a
+    membership that never ends would keep a call open for good.
+    """
+    content = _obj(event.get("content"))
+    sticky_key = content.get("sticky_key", content.get("msc4354_sticky_key"))
+    if not isinstance(sticky_key, str) or not sticky_key:
+        return None
+    if content.get("msc4354_sticky_key", sticky_key) != sticky_key:
+        return None
+    sender = str(event.get("sender") or "")
+    sent = _int(event.get("origin_server_ts"))
+    duration = _int(_obj(event.get("sticky") or event.get("msc4354_sticky"))
+                    .get("duration_ms")) or MAX_STICKY_MS
+    unsigned = _obj(event.get("unsigned"))
+    remaining = _int(unsigned.get("sticky_duration_remaining_ms",
+                                  unsigned.get("msc4354_sticky_duration_ttl_ms")))
+    expires_at = (now_ms + min(remaining, MAX_STICKY_MS) if remaining > 0
+                  else sent + min(duration, MAX_STICKY_MS))
+    return RtcEntry((sender, sticky_key), sent + duration, str(event.get("event_id") or ""),
+                    expires_at, _rtc_membership(event, content, sender, expires_at))
+
+
+def _rtc_membership(event: dict, content: dict, sender: str,
+                    expires_at: int) -> Membership | None:
+    member = _obj(content.get("member"))
+    if member.get("membership", "join") != "join":
+        return None
+    # A leave from before `member.membership` has no application: it stops here.
+    if content.get("slot_id") != CALL_SLOT \
+            or _obj(content.get("application")).get("type") != "m.call":
+        return None
+    if member.get("user_id") != sender:
+        # matrix-js-sdk refuses these too: nothing stops anyone from sending
+        # one in someone else's name.
+        logger.warning("call membership from %s in %s claims to be %r; ignored",
+                       sender, event.get("room_id"), member.get("user_id"))
+        return None
+    device_id, member_id = member.get("device_id"), member.get("id")
+    if not isinstance(device_id, str) or not device_id \
+            or not isinstance(member_id, str) or not member_id:
+        return None
+    published = _obj(content.get("transports")).get("published")
+    if not isinstance(published, list) or not any(
+            isinstance(t, dict) and t.get("type") == "livekit" for t in published):
+        logger.warning("call membership of %s in %s publishes no livekit transport",
+                       sender, event.get("room_id"))
+        return None
+    return Membership(sender, device_id, member_id, expires_at)
+
+
+def _obj(value) -> dict:
+    """A JSON object, or an empty one for anything else: a field of the wrong
+    type in someone's event is not a reason to fail the whole transaction."""
+    return value if isinstance(value, dict) else {}
+
+
+def _int(value) -> int:
+    """A positive integer from JSON, else 0. Booleans are not numbers here."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return 0
+    return max(value, 0)

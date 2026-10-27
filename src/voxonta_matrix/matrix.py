@@ -76,6 +76,35 @@ class MatrixClient:
         state = await self._call("GET", f"/rooms/{quote(room_id, safe='')}/state")
         return state if isinstance(state, list) else []
 
+    async def recent_events(self, room_id: str, types: list[str], since_ms: int,
+                            *, page: int = 100, max_pages: int = 10) -> list[dict]:
+        """The room's events of these types sent since `since_ms`, newest first.
+
+        Sticky events are not room state, so /state does not have them; the
+        timeline does. Read backwards a page at a time until a page reaches
+        past `since_ms` — or `max_pages` have been read, which an hour of call
+        memberships does not come near.
+        """
+        path = f"/rooms/{quote(room_id, safe='')}/messages"
+        params = {"dir": "b", "limit": str(page),
+                  "filter": json.dumps({"types": types}, separators=(",", ":"))}
+        found: list[dict] = []
+        for _ in range(max_pages):
+            async with self._session.get(self._base + path, params=params,
+                                         headers=self._headers) as resp:
+                data = await _answer(resp)
+            chunk = [e for e in data.get("chunk") or [] if isinstance(e, dict)]
+            found += [e for e in chunk if _ts(e) >= since_ms]
+            end = data.get("end")
+            if not chunk or not end or any(_ts(e) < since_ms for e in chunk):
+                break
+            params["from"] = str(end)
+        else:
+            logger.warning("read %d events back in %s and stopped short of the hour; "
+                           "devices that joined earlier are missed until they re-announce",
+                           len(found), room_id)
+        return found
+
     async def send(self, room_id: str, content: dict, txn_id: str) -> str:
         """Post a message as the bot and return its event id.
 
@@ -99,6 +128,11 @@ class MatrixClient:
         if not uri.startswith("mxc://"):
             raise MatrixError(resp.status, "", "upload answered without a content_uri")
         return uri
+
+
+def _ts(event: dict) -> int:
+    ts = event.get("origin_server_ts")
+    return ts if isinstance(ts, int) and not isinstance(ts, bool) else 0
 
 
 async def _answer(resp: aiohttp.ClientResponse):

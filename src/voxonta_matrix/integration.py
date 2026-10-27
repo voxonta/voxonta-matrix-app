@@ -32,7 +32,7 @@ from voxonta_matrix.commands import command_in, notice
 from voxonta_matrix.livekit import capture_token
 from voxonta_matrix.matrix import MatrixError
 from voxonta_matrix.rooms import Room
-from voxonta_matrix.rtc import livekit_room
+from voxonta_matrix.rtc import MAX_STICKY_MS, RTC_MEMBER_TYPES, livekit_room
 from voxonta_matrix.store import Call, Meeting
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,19 @@ class Integration:
         room = Room(room_id)
         for event in state:
             room.apply(event)
+        # Devices on MatrixRTC's sticky memberships are not in the state. Each
+        # lasts an hour at most, so the last hour of the timeline has them all.
+        now_ms = int(self._clock() * 1000)
+        try:
+            recent = await self.matrix.recent_events(room_id, list(RTC_MEMBER_TYPES),
+                                                     now_ms - MAX_STICKY_MS)
+        except (MatrixError, aiohttp.ClientError, TimeoutError) as e:
+            # Served without them: a device still in a call re-announces
+            # itself within the hour, and the next to join is seen at once.
+            logger.warning("could not read recent call memberships in %s: %s", room_id, e)
+            recent = []
+        for event in recent:
+            room.apply_rtc(event, now_ms)
         self.rooms[room_id] = room
 
     # ── events from the homeserver ────────────────────────────────────
@@ -159,6 +172,9 @@ class Integration:
         action = command_in(event)
         if action is not None and event.get("sender") != self.bot:
             await self._on_command(room, event, action)
+            return
+        if event.get("type") in RTC_MEMBER_TYPES:
+            room.apply_rtc(event, int(self._clock() * 1000))
             return
         room.apply(event)
 

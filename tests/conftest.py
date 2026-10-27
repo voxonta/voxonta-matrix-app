@@ -50,8 +50,12 @@ class Clock:
 class FakeMatrix:
     """The client calls the integration makes, against rooms held in memory."""
 
-    def __init__(self, state: dict[str, list[dict]] | None = None) -> None:
+    def __init__(self, state: dict[str, list[dict]] | None = None,
+                 timeline: dict[str, list[dict]] | None = None) -> None:
         self.state = {room: list(events) for room, events in (state or {}).items()}
+        # Events that are not state — sticky call memberships — oldest first.
+        self.timeline = {room: list(events) for room, events in (timeline or {}).items()}
+        self.fail_recent: Exception | None = None
         self.joined = set(self.state)
         self.log: list[tuple[str, str]] = []
         self.fail_join: Exception | None = None
@@ -85,6 +89,13 @@ class FakeMatrix:
 
     async def room_state(self, room_id: str) -> list[dict]:
         return list(self.state.get(room_id, []))
+
+    async def recent_events(self, room_id: str, types: list[str], since_ms: int) -> list[dict]:
+        self.log.append(("recent", room_id, since_ms))
+        if self.fail_recent is not None:
+            raise self.fail_recent
+        return [e for e in reversed(self.timeline.get(room_id, []))
+                if e["type"] in types and e["origin_server_ts"] >= since_ms]
 
     def _failure(self, attr: str) -> None:
         error = getattr(self, attr)
@@ -195,6 +206,34 @@ def device(user: str, device_id: str, *, created_s: float = T0,
     return {"type": "org.matrix.msc3401.call.member", "room_id": room,
             "state_key": f"_{user}_{device_id}_m.call", "sender": user,
             "origin_server_ts": int(created_s * 1000), "content": content}
+
+
+RTC_MEMBER = "org.matrix.msc4143.rtc.member"
+
+
+def rtc_device(user: str, device_id: str, *, sent_s: float = T0, room: str = ROOM,
+               left: bool = False, member_id: str = "", event_id: str = "",
+               duration_ms: int = 3_600_000) -> dict:
+    """A MatrixRTC membership, shaped as matrix-js-sdk's sticky membership
+    manager sends it: joined, or left with `member.membership`."""
+    member_id = member_id or f"{device_id.lower()}-0f3c-4d2e-9a1b-member"
+    content = {
+        "slot_id": "m.call#ROOM", "member": {"id": member_id, "membership": "leave"},
+        "msc4354_sticky_key": member_id,
+    } if left else {
+        "application": {"type": "m.call", "m.call.intent": "video"},
+        "slot_id": "m.call#ROOM",
+        "transports": {"published": [{"type": "livekit", "url": "wss://livekit.example.org"}],
+                       "can_subscribe": ["livekit"]},
+        "member": {"device_id": device_id, "user_id": user, "id": member_id,
+                   "membership": "join"},
+        "msc4354_sticky_key": member_id,
+    }
+    sent_ms = int(sent_s * 1000)
+    return {"type": RTC_MEMBER, "room_id": room, "sender": user,
+            "event_id": event_id or f"${sent_ms}{device_id}{'L' if left else 'J'}",
+            "origin_server_ts": sent_ms, "msc4354_sticky": {"duration_ms": duration_ms},
+            "content": content}
 
 
 @pytest.fixture

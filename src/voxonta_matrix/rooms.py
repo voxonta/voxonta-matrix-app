@@ -1,9 +1,9 @@
 """What the integration knows about a room: its name, who is in it, who is in its call.
 
-Built from the room's state when the bot joins (or the service starts) and kept
-current from the events the homeserver pushes. Held in memory only — the
-homeserver has it all, and asking again on start is cheaper than keeping a
-second copy that can disagree with the first.
+Built from the room's state, and its recent call memberships, when the bot
+joins (or the service starts), and kept current from the events the homeserver
+pushes. Held in memory only — the homeserver has it all, and asking again on
+start is cheaper than keeping a second copy that can disagree with the first.
 """
 from __future__ import annotations
 
@@ -12,9 +12,10 @@ from dataclasses import dataclass, field
 
 from voxonta_matrix.rtc import (
     LEGACY_MEMBER,
-    RTC_MEMBER_TYPES,
     Membership,
+    RtcEntry,
     parse_legacy_member,
+    parse_rtc_member,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,9 @@ class Room:
     members: dict[str, str] = field(default_factory=dict)
     # Devices in the call, by the state key of their membership event.
     memberships: dict[str, Membership] = field(default_factory=dict)
+    # Devices in the call that announce themselves with sticky m.rtc.member
+    # events, by sender and sticky key.
+    rtc: dict[tuple[str, str], RtcEntry] = field(default_factory=dict)
     encrypted: bool = False
     # From m.room.create: who made the room, and its version.
     creators: set[str] = field(default_factory=set)
@@ -44,8 +48,6 @@ class Room:
     # From m.room.power_levels; None until the room has one.
     power_users: dict[str, int] | None = None
     power_default: int = 0
-    # Formats already reported for this room, so a busy call logs it once.
-    _reported: set[str] = field(default_factory=set)
 
     def apply(self, event: dict) -> None:
         """Take in one state event. Anything not about the room's call or its
@@ -85,13 +87,23 @@ class Room:
                 self.memberships.pop(key, None)
             else:
                 self.memberships[key] = membership
-        elif etype in RTC_MEMBER_TYPES and etype not in self._reported:
-            self._reported.add(etype)
-            logger.warning("room %s uses %s call memberships, which this version does "
-                           "not read: its calls will not be transcribed", self.room_id, etype)
+
+    def apply_rtc(self, event: dict, now_ms: int) -> None:
+        """Take in one `m.rtc.member` event, from a transaction or the
+        room's recent history. Entries that have stopped counting go."""
+        entry = parse_rtc_member(event, now_ms)
+        if entry is not None:
+            current = self.rtc.get(entry.key)
+            if current is None or entry.supersedes(current):
+                self.rtc[entry.key] = entry
+        for key in [k for k, e in self.rtc.items() if e.expires_at_ms <= now_ms]:
+            del self.rtc[key]
 
     def active(self, now_ms: int) -> list[Membership]:
-        return [m for m in self.memberships.values() if m.active(now_ms)]
+        """The devices in the call now, in whichever format they said so."""
+        rtc = [e.membership for e in self.rtc.values()
+               if e.membership is not None and e.membership.active(now_ms)]
+        return [m for m in self.memberships.values() if m.active(now_ms)] + rtc
 
     def name_of(self, user_id: str) -> str:
         """How to call a person: their display name, else the local part of the id."""
