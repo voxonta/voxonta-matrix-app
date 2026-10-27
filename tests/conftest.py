@@ -1,13 +1,18 @@
-"""Fakes for the homeserver and a clock, shared by the tests.
+"""Fakes for the homeserver, the gateway and a clock, shared by the tests.
 
-Nothing here talks to a network: a call is a handful of state events, and the
-homeserver is the few client calls the integration makes.
+Nothing here talks to a network: a call is a handful of state events, the
+homeserver is the few client calls the integration makes, and the gateway is
+a dict of meetings answering in the shape of its HTTP API.
 """
 from __future__ import annotations
+
+import hashlib
 
 import pytest
 
 from voxonta_matrix.config import Config
+from voxonta_matrix.gateway import Artifact, GatewayUnavailable, MeetingState, UnknownMeeting
+from voxonta_matrix.matrix import MatrixError
 
 SERVER = "example.org"
 BOT = f"@voxonta-bot:{SERVER}"
@@ -26,6 +31,8 @@ def make_config(**overrides) -> Config:
         "livekit_api_secret": "a-livekit-secret-long-enough-for-hs256",
         "database_url": "",
         "service_token": "service-token",
+        "gateway_url": "https://gateway.example.org",
+        "gateway_token": "gateway-token",
         "call_end_grace_s": 90.0,
     }
     values.update(overrides)
@@ -49,6 +56,16 @@ class FakeMatrix:
         self.log: list[tuple[str, str]] = []
         self.fail_join: Exception | None = None
         self.displayname = None
+        # Messages posted, in order: (room, content, txn_id, event_id).
+        self.sent: list[tuple[str, dict, str, str]] = []
+        self.uploads: dict[str, tuple[bytes, str, str]] = {}
+        # Raised by the next send/upload, then cleared — or kept, if sticky.
+        self.fail_send: Exception | None = None
+        self.fail_upload: Exception | None = None
+        self.sticky = False
+        # Synapse answers a repeated transaction id with the event it already
+        # made — for half an hour. Off, to test what holds beyond that.
+        self.remember_txns = True
 
     async def ensure_bot(self, displayname: str) -> None:
         self.displayname = displayname
@@ -68,6 +85,85 @@ class FakeMatrix:
 
     async def room_state(self, room_id: str) -> list[dict]:
         return list(self.state.get(room_id, []))
+
+    def _failure(self, attr: str) -> None:
+        error = getattr(self, attr)
+        if error is not None:
+            if not self.sticky:
+                setattr(self, attr, None)
+            raise error
+
+    async def send(self, room_id: str, content: dict, txn_id: str) -> str:
+        self._failure("fail_send")
+        if self.remember_txns:
+            for room, _, txn, event_id in self.sent:
+                if (room, txn) == (room_id, txn_id):
+                    return event_id
+        event_id = f"$event{len(self.sent) + 1}"
+        self.sent.append((room_id, content, txn_id, event_id))
+        return event_id
+
+    async def upload(self, data: bytes, filename: str, content_type: str) -> str:
+        self._failure("fail_upload")
+        uri = f"mxc://{SERVER}/file{len(self.uploads) + 1}"
+        self.uploads[uri] = (data, filename, content_type)
+        return uri
+
+    # What a person in the room sees.
+    def announcements(self) -> list[dict]:
+        return [c for _, c, _, _ in self.sent if c.get("msgtype") == "m.text"]
+
+    def files(self) -> list[tuple[str, bytes, str]]:
+        """(name, content, thread root) for every file posted."""
+        return [(c["body"], self.uploads[c["url"]][0], c["m.relates_to"]["event_id"])
+                for _, c, _, _ in self.sent if c.get("msgtype") == "m.file"]
+
+
+FORBIDDEN = MatrixError(403, "M_FORBIDDEN", "not in room")
+
+
+class FakeGateway:
+    """Meetings by session id, answering like the gateway's HTTP API."""
+
+    def __init__(self) -> None:
+        self.meetings: dict[str, dict] = {}
+        self.acked: list[tuple[str, list[str]]] = []
+        self.rows: list[dict] = []          # what /undelivered answers
+        self.down = False
+        self.corrupt: set[str] = set()      # digests that arrive damaged
+        self.asked: list[str] = []
+
+    def put(self, session_id: str, status: str, files: dict[str, tuple[str, bytes]] | None = None,
+            detail: str = "") -> None:
+        """files: name -> (kind, content)."""
+        self.meetings[session_id] = {
+            "status": status, "detail": detail,
+            "artifacts": [(Artifact(name, kind, hashlib.sha256(body).hexdigest(), len(body)), body)
+                          for name, (kind, body) in (files or {}).items()]}
+
+    async def meeting(self, session_id: str) -> MeetingState:
+        self.asked.append(session_id)
+        if self.down:
+            raise GatewayUnavailable("down")
+        m = self.meetings.get(session_id)
+        if m is None:
+            raise UnknownMeeting(session_id)
+        return MeetingState(m["status"], m["status"] in ("complete", "failed"), m["detail"],
+                            tuple(a for a, _ in m["artifacts"]))
+
+    async def artifact(self, session_id: str, sha256: str) -> bytes:
+        if self.down or sha256 in self.corrupt:
+            raise GatewayUnavailable("no")
+        for a, body in self.meetings[session_id]["artifacts"]:
+            if a.sha256 == sha256:
+                return body
+        raise GatewayUnavailable("HTTP 404")
+
+    async def undelivered(self, sources: list[str]) -> list[dict]:
+        return [] if self.down else [dict(r) for r in self.rows]
+
+    async def ack(self, session_id: str, digests: list[str]) -> None:
+        self.acked.append((session_id, list(digests)))
 
 
 def member(user: str, membership: str = "join", name: str = "", *,

@@ -87,3 +87,76 @@ def test_transactions_are_remembered_and_forgotten_in_time(make_store):
         return seen
 
     assert run(go()) == (False, True)
+
+
+def test_delivery_progress_survives_and_finished_meetings_leave_the_queue(make_store):
+    room = f"!{uuid.uuid4().hex}:example.org"
+    due, later, done = (str(uuid.uuid4()) for _ in range(3))
+
+    async def go():
+        store = make_store()
+        await store.open()
+        for sid in (due, later, done):
+            assert await store.add_meeting(Meeting(sid, room, "Дейли", 0, 4600))
+        assert not await store.add_meeting(Meeting(due, room, "другое", 0, 1))
+
+        m = await store.get_meeting(later)
+        m.misses, m.next_try = 2, 9000.0
+        await store.save_meeting(m)
+        m = await store.get_meeting(due)
+        m.thread_root, m.published = "$root", ["a" * 64, "b" * 64]
+        await store.save_meeting(m)
+        m = await store.get_meeting(done)
+        m.done_at = 5000.0
+        await store.save_meeting(m)
+
+        mine = {m.session_id for m in await store.due_meetings(8000.0)} & {due, later, done}
+        pending = {m.session_id for m in await store.pending_meetings()} & {due, later, done}
+        loaded = await store.get_meeting(due)
+        await store.prune_meetings(4999.0)
+        kept = await store.get_meeting(done)
+        await store.prune_meetings(5001.0)
+        pruned = await store.get_meeting(done)
+        await store.close()
+        return mine, pending, loaded, kept, pruned
+
+    mine, pending, loaded, kept, pruned = run(go())
+    assert mine == {due}
+    assert pending == {due, later}
+    assert loaded == Meeting(due, room, "Дейли", 0, 4600, thread_root="$root",
+                             published=["a" * 64, "b" * 64])
+    assert kept is not None and pruned is None
+
+
+@pytest.mark.skipif(not _PG, reason="TEST_DATABASE_URL is not set")
+def test_a_meetings_table_from_before_publishing_gets_its_new_columns():
+    import psycopg
+
+    schema = f"s{uuid.uuid4().hex[:12]}"
+    sid = str(uuid.uuid4())
+
+    async def go():
+        from voxonta_matrix.store import PostgresStore
+
+        with psycopg.connect(_PG, autocommit=True) as conn:
+            conn.execute(f"CREATE SCHEMA {schema}")
+            conn.execute(f"CREATE TABLE {schema}.meetings (session_id TEXT PRIMARY KEY,"
+                         " room_id TEXT NOT NULL, room_name TEXT NOT NULL DEFAULT '',"
+                         " started_at BIGINT NOT NULL, ended_at BIGINT NOT NULL)")
+            conn.execute(f"INSERT INTO {schema}.meetings VALUES (%s, '!r:x', 'Дейли', 1, 2)",
+                         (sid,))
+        sep = "&" if "?" in _PG else "?"
+        store = PostgresStore(f"{_PG}{sep}options=-csearch_path%3D{schema}")
+        try:
+            await store.open()
+            [meeting] = await store.due_meetings(0.0)
+            meeting.published = ["c" * 64]
+            await store.save_meeting(meeting)
+            return await store.get_meeting(sid)
+        finally:
+            await store.close()
+            with psycopg.connect(_PG, autocommit=True) as conn:
+                conn.execute(f"DROP SCHEMA {schema} CASCADE")
+
+    meeting = run(go())
+    assert (meeting.session_id, meeting.misses, meeting.published) == (sid, 0, ["c" * 64])
