@@ -35,10 +35,15 @@ capture service runs wherever there is CPU to spare and reaches it over HTTPS.
 | ✅ | the capture service's LiveKit driver (nextcloud-talk-capture, `[livekit]` extra) |
 | ✅ | publishing the summary and the transcript into the room |
 | ✅ | the announcement at the start of a call, and `!без-записи` / `!запись` for room admins |
-| ⏳ | `m.rtc.member` (MSC4143) memberships — reported in the log until then |
+| ✅ | both call formats: the `org.matrix.msc3401.call.member` state events Element Call sends today, and the MatrixRTC `m.rtc.member` sticky events (MSC4143, MSC4354) it is moving to |
 
 Calls in rooms without the bot — direct calls included — are never looked at.
-An encrypted room is reported in the log: the bot cannot hear an encrypted call.
+An encrypted room is reported in the log: the bot cannot hear an encrypted call
+(and in one, MatrixRTC memberships are encrypted too, so it cannot see it either).
+
+MatrixRTC memberships are not room state. The bot reads them as they arrive and,
+when it starts or joins a room, from the last hour of the room's timeline — no
+membership lasts longer than that, so nothing older can still be in a call.
 
 ## During a call
 

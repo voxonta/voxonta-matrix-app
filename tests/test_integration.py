@@ -23,11 +23,12 @@ from conftest import (
     make_config,
     member,
     room_name,
+    rtc_device,
 )
 
 from voxonta_matrix.integration import Integration, TryAgain
 from voxonta_matrix.matrix import MatrixError
-from voxonta_matrix.rtc import livekit_room
+from voxonta_matrix.rtc import _hash, livekit_room
 from voxonta_matrix.store import MemoryStore
 
 ALICE = f"@alice:{SERVER}"
@@ -41,10 +42,10 @@ def daily_room(*extra: dict) -> dict[str, list[dict]]:
 
 
 class Setup:
-    def __init__(self, state=None, *, store=None, clock=None) -> None:
+    def __init__(self, state=None, *, timeline=None, store=None, clock=None) -> None:
         self.clock = clock or Clock()
         self.store = store or MemoryStore()
-        self.matrix = FakeMatrix(daily_room() if state is None else state)
+        self.matrix = FakeMatrix(daily_room() if state is None else state, timeline)
         self.integration = Integration(make_config(), self.store, self.matrix, clock=self.clock)
         self._txn = 0
 
@@ -331,3 +332,123 @@ def test_an_invite_the_server_refuses_is_dropped_not_retried():
 
     s = run(go())
     assert run(s.store.txn_seen("t1"))
+
+
+# ── MatrixRTC sticky memberships ──────────────────────────────────────
+#
+# The format clients are moving to: one sticky event per device, not state.
+# The call itself must behave exactly as above; what differs is where the
+# devices come from, how they leave, and how long a silent one counts.
+
+def test_a_matrixrtc_call_starts_names_its_people_and_ends():
+    async def go():
+        s = await Setup().start()
+        await s.send(rtc_device(ALICE, "LAPTOP", member_id="m-alice"),
+                     rtc_device(BOB, "PHONE", member_id="m-bob"))
+        await s.after(0)
+        during = s.listing()
+        s.clock.now += 600
+        await s.send(rtc_device(ALICE, "LAPTOP", member_id="m-alice", sent_s=s.clock.now,
+                                left=True),
+                     rtc_device(BOB, "PHONE", member_id="m-bob", sent_s=s.clock.now,
+                                left=True))
+        still = s.listing()
+        await s.after(90)
+        return s, during, still
+
+    s, [call], still = run(go())
+    assert call["recording"] is True
+    # What lk-jwt-service 0.9.0 names a client on the homeserver's get_token.
+    assert call["members"][_hash(ALICE, "m-alice")] == {"name": "Алиса", "user": ALICE}
+    assert call["members"][_hash(BOB, "m-bob")] == {"name": "Боб", "user": BOB}
+    assert [c["session_id"] for c in still] == [call["session_id"]]   # the pause first
+    assert s.listing() == []
+    assert len(run(s.store.pending_meetings())) == 1
+
+
+def test_a_matrixrtc_device_that_vanished_stops_counting_after_its_hour():
+    async def go():
+        s = await Setup().start()
+        await s.send(rtc_device(ALICE, "PHONE"))
+        await s.after(3599)
+        alive = len(s.listing())
+        await s.after(1)
+        await s.after(90)
+        return s, alive
+
+    s, alive = run(go())
+    assert alive == 1
+    assert s.listing() == []
+
+
+def test_a_device_that_re_announces_itself_keeps_the_call_going():
+    # Clients send their membership again before the hour runs out.
+    async def go():
+        s = await Setup().start()
+        await s.send(rtc_device(ALICE, "LAPTOP", member_id="m-1"))
+        first = s.listing()[0]["session_id"]
+        await s.after(3000)
+        await s.send(rtc_device(ALICE, "LAPTOP", member_id="m-1", sent_s=s.clock.now))
+        await s.after(3000)
+        return first, s.listing()
+
+    first, [call] = run(go())
+    assert call["session_id"] == first
+
+
+def test_a_restart_in_the_middle_of_a_matrixrtc_call_keeps_its_session():
+    # Sticky memberships are not state: they come back from the timeline.
+    store = MemoryStore()
+    clock = Clock()
+    timeline = {ROOM: [rtc_device(ALICE, "LAPTOP")]}
+
+    async def go():
+        s = await Setup(timeline=timeline, store=store, clock=clock).start()
+        before = s.listing()[0]["session_id"]
+        clock.now += 300
+        again = await Setup(timeline=timeline, store=store, clock=clock).start()
+        await again.after(90)
+        return before, again
+
+    before, again = run(go())
+    assert [c["session_id"] for c in again.listing()] == [before]
+    # The last hour: no sticky membership outlives it.
+    assert ("recent", ROOM, int((T0 + 300 - 3600) * 1000)) in again.matrix.log
+
+
+def test_an_hour_old_membership_in_the_timeline_is_not_a_call():
+    async def go():
+        clock = Clock()
+        s = await Setup(timeline={ROOM: [rtc_device(ALICE, "LAPTOP", sent_s=T0 - 3600)]},
+                        clock=clock).start()
+        return s
+
+    assert run(go()).listing() == []
+
+
+def test_a_room_whose_history_cannot_be_read_is_still_served():
+    async def go():
+        s = Setup(timeline={ROOM: [rtc_device(ALICE, "LAPTOP")]})
+        s.matrix.fail_recent = MatrixError(500, "M_UNKNOWN", "boom")
+        await s.start()
+        served = ROOM in s.integration.rooms
+        before = s.listing()
+        # The device re-announces itself; from then on the call is seen.
+        await s.send(rtc_device(ALICE, "LAPTOP", sent_s=s.clock.now))
+        return served, before, s.listing()
+
+    served, before, after = run(go())
+    assert served and before == [] and len(after) == 1
+
+
+def test_a_bot_invited_into_a_running_matrixrtc_call_sees_it():
+    async def go():
+        s = await Setup(state={}).start()
+        s.matrix.state["!new:example.org"] = [member(BOT), member(ALICE)]
+        s.matrix.timeline["!new:example.org"] = [rtc_device(ALICE, "LAPTOP",
+                                                            room="!new:example.org")]
+        await s.send(member(BOT, "invite", room="!new:example.org", sender=ALICE))
+        return s
+
+    [call] = run(go()).listing()
+    assert call["token"] == "!new:example.org"

@@ -170,6 +170,80 @@ def test_a_message_and_a_file_go_where_the_spec_puts_them():
     assert h1["Authorization"] == h2["Authorization"] == "Bearer as-key"
 
 
+def test_recent_memberships_are_read_back_until_an_hour_ago():
+    seen = []
+    pages = {
+        None: ({"chunk": [{"type": "m.rtc.member", "origin_server_ts": 5_000},
+                          {"type": "m.rtc.member", "origin_server_ts": 4_000}],
+                "end": "t2"}),
+        "t2": ({"chunk": [{"type": "m.rtc.member", "origin_server_ts": 3_000},
+                          {"type": "m.rtc.member", "origin_server_ts": 900}],
+                "end": "t3"}),
+        "t3": ({"chunk": [{"type": "m.rtc.member", "origin_server_ts": 800}]}),
+    }
+
+    async def messages(request):
+        return web.json_response(pages[request.query.get("from")])
+
+    async def go():
+        server = await serve([web.get("/_matrix/client/v3/rooms/{room}/messages", messages)],
+                             seen)
+        async with aiohttp.ClientSession() as session:
+            mx = MatrixClient(str(server.make_url("/")), "as-key", "@bot:x.org", session)
+            events = await mx.recent_events("!r:x.org", ["m.rtc.member"], since_ms=1_000)
+        await server.close()
+        return events
+
+    events = run(go())
+    # The page that reaches past the hour is the last one asked for.
+    assert [e["origin_server_ts"] for e in events] == [5_000, 4_000, 3_000]
+    assert len(seen) == 2
+    first, second = (unquote(p) for _, p, _, _ in seen)
+    assert first.startswith("/_matrix/client/v3/rooms/!r:x.org/messages?")
+    assert "dir=b" in first and 'filter={"types":["m.rtc.member"]}' in first
+    assert "from=t2" in second and "from" not in first
+
+
+def test_a_room_with_no_memberships_takes_one_request():
+    seen = []
+
+    async def messages(request):
+        return web.json_response({"chunk": []})
+
+    async def go():
+        server = await serve([web.get("/_matrix/client/v3/rooms/{room}/messages", messages)],
+                             seen)
+        async with aiohttp.ClientSession() as session:
+            mx = MatrixClient(str(server.make_url("/")), "k", "@bot:x.org", session)
+            events = await mx.recent_events("!r:x.org", ["m.rtc.member"], since_ms=0)
+        await server.close()
+        return events
+
+    assert run(go()) == [] and len(seen) == 1
+
+
+def test_reading_back_stops_after_so_many_pages(caplog):
+    seen = []
+
+    async def messages(request):
+        n = int(request.query.get("from", "0"))
+        return web.json_response({"chunk": [{"origin_server_ts": 10_000 - n}],
+                                  "end": str(n + 1)})
+
+    async def go():
+        server = await serve([web.get("/_matrix/client/v3/rooms/{room}/messages", messages)],
+                             seen)
+        async with aiohttp.ClientSession() as session:
+            mx = MatrixClient(str(server.make_url("/")), "k", "@bot:x.org", session)
+            events = await mx.recent_events("!r:x.org", ["m.rtc.member"], since_ms=0,
+                                            max_pages=3)
+        await server.close()
+        return events
+
+    assert len(run(go())) == 3 and len(seen) == 3
+    assert "stopped short of the hour" in caplog.text
+
+
 def test_a_refusal_carries_its_status():
     async def go():
         server = await serve(homeserver_routes(refuse=True), [])
