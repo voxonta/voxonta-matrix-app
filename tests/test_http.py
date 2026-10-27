@@ -111,6 +111,36 @@ def test_a_heartbeat_is_answered_with_the_settings_and_shows_in_health():
     assert after == {"status": "ok", "rooms": 1, "calls": 0, "capture_seen_s_ago": 0}
 
 
+def test_a_poll_counts_as_the_capture_service_checking_in():
+    # The heartbeat comes once a minute; polls every few seconds. Health that
+    # only counted the heartbeat raised alarms between two of them.
+    async def go():
+        i = integration()
+        await i.start()
+        clock = Clock()
+        c = await client(service_app(i, "service-token", clock=clock))
+        auth = {"Authorization": "Bearer service-token"}
+        try:
+            await c.post(SERVICE_PREFIX + "/heartbeat", json={"version": "0.3.2"},
+                         headers=auth)
+            clock.now += 55
+            stale = await (await c.get("/healthz")).json()
+            await c.get(SERVICE_PREFIX + "/calls", headers=auth)
+            clock.now += 2
+            fresh = await (await c.get("/healthz")).json()
+            await c.get(SERVICE_PREFIX + "/calls")    # no key: not the capture service
+            clock.now += 3
+            refused = await (await c.get("/healthz")).json()
+            return stale, fresh, refused
+        finally:
+            await c.close()
+
+    stale, fresh, refused = run(go())
+    assert stale["capture_seen_s_ago"] == 55
+    assert fresh["capture_seen_s_ago"] == 2
+    assert refused["capture_seen_s_ago"] == 5
+
+
 # ── the homeserver's side ─────────────────────────────────────────────
 
 def test_the_homeserver_has_to_prove_itself():
