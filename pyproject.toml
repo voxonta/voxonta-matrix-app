@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxonta-matrix-app"
-version = "0.2.0"
-description = "Voxonta for Matrix: transcribe Element Call meetings in rooms the bot is invited to"
+version = "0.3.0"
+description = "Voxonta for Matrix: standalone transcription widget for Element Call"
 readme = "README.md"
 requires-python = ">=3.12"
 # MIT, like the Nextcloud capture service it pairs with: this is an integration

@@ -68,8 +68,14 @@ jobs:
           repository: voxonta/nextcloud-talk-capture
           ref: ${{ env.CAPTURE_REF }}
           path: .capture-source
+      - name: Release notes
+        run: |
+          notes="docs/releases/${GITHUB_REF_NAME#v}.md"
+          test -f "$notes"
+          echo "RELEASE_NOTES=$notes" >> "$GITHUB_ENV"
       - name: Build installation package
         run: python3 scripts/build_bundle.py --capture-source .capture-source
       - uses: softprops/action-gh-release@v2
         with:
+          body_path: ${{ env.RELEASE_NOTES }}
           files: dist/*
