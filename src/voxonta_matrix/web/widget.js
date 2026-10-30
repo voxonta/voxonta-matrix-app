@@ -9,7 +9,7 @@ if (!params.get('widgetId')) {
 const parentHint=params.get('parentUrl')||document.referrer;
 const parentOrigin=parentHint?new URL(parentHint).origin:null;
 const widget=new sdk.WidgetApi(params.get('widgetId'),parentOrigin);
-let token=null,expires=0,busy=false,current=null,pendingCommand=null;
+let token=null,expires=0,busy=false,current=null,pendingCommand=null,refreshPromise=null;
 const phases={idle:'Готово к расшифровке',starting:'Подключаемся к звонку',transcribing:'Идёт расшифровка',stopping:'Останавливаем передачу звука',paused:'Расшифровка приостановлена',unknown:'Проверяем связь с захватом'};
 function error(e){$('error').textContent=e?.message||'';$('error').hidden=!e;}
 async function api(path,body={}){
@@ -35,7 +35,16 @@ function render(s){
   if(!m.artifacts.length){const p=document.createElement('p');p.textContent=m.phase==='empty'?'В этой встрече не было звука для расшифровки.':m.phase==='failed'?'Обработка завершилась с ошибкой.':'Готовим материалы встречи';el.append(p);}host.append(el);
  }
 }
-async function refresh(){try{if(Date.now()>expires)await login();render(await api('status'));error(null);}catch(e){error(e);$('retry').hidden=false;}}
+// OpenID may wait on a person: timer, retry and command callers share this flight.
+// Keep the wrapper synchronous so callers receive the identical Promise.
+function refresh(){
+ if(refreshPromise)return refreshPromise;
+ refreshPromise=(async()=>{
+  try{if(Date.now()>expires)await login();render(await api('status'));error(null);$('retry').hidden=true;}
+  catch(e){error(e);$('retry').hidden=false;}
+ })().finally(()=>{refreshPromise=null;});
+ return refreshPromise;
+}
 async function command(action,value){if(busy)return;const before=current;
  if(current&&action==='auto_transcribe')current={...current,auto_transcribe:value};
  if(current&&action==='settings')current={...current,auto_publish:value};
