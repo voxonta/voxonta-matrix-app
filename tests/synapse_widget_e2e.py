@@ -2,11 +2,11 @@
 
 import json
 import os
-from concurrent.futures import ThreadPoolExecutor
 import time
-import urllib.request
 import urllib.error
 import urllib.parse
+import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 
 BASE = "http://127.0.0.1:18770"
 

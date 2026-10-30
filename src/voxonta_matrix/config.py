@@ -7,8 +7,8 @@ database are the installation's, and this repository is public.
 from __future__ import annotations
 
 import os
-from urllib.parse import urlsplit
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
 # Variables without a sensible default. Checked together so a first start
 # names everything that is missing, not one variable per restart.

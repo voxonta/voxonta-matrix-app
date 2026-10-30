@@ -107,11 +107,12 @@ def test_widget_http_checks_origin_openid_scope_and_current_membership():
 def test_old_capture_builds_never_receive_widget_calls():
     async def go():
         from types import SimpleNamespace
-        from voxonta_matrix.http import service_app, SERVICE_PREFIX
+
+        from voxonta_matrix.http import SERVICE_PREFIX, service_app
 
         s = setup()
         await s.w.command(ROOM, ALICE, "start", "start")
-        integration = SimpleNamespace(calls_listing=lambda: [])
+        integration = SimpleNamespace(calls_listing=list)
         client = TestClient(TestServer(service_app(integration, "service-secret", widget=s.w)))
         await client.start_server()
         try:

@@ -3,7 +3,7 @@ import copy
 from types import SimpleNamespace
 
 import pytest
-from conftest import Clock, FakeGateway, ROOM, device, make_config, member
+from conftest import ROOM, Clock, FakeGateway, device, make_config, member
 
 from voxonta_matrix.room_access import AccessUnavailable
 from voxonta_matrix.rooms import Room
@@ -232,6 +232,7 @@ def test_store_rollback_never_accepts_half_command():
 def test_widget_only_mode_never_registers_a_bot():
     async def go():
         from conftest import FakeMatrix
+
         from voxonta_matrix.integration import Integration
         from voxonta_matrix.store import MemoryStore
 
@@ -246,7 +247,7 @@ def test_widget_only_mode_never_registers_a_bot():
 
 
 def test_widget_config_without_appservice_secrets_and_with_explicit_origins():
-    from voxonta_matrix.config import Config, _REQUIRED
+    from voxonta_matrix.config import _REQUIRED, Config
 
     env = {key: "test" for key in _REQUIRED}
     env.pop("MATRIX_AS_TOKEN")

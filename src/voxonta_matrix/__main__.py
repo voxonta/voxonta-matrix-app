@@ -22,11 +22,11 @@ from voxonta_matrix.gateway import GatewayClient
 from voxonta_matrix.http import appservice_app, service_app
 from voxonta_matrix.integration import Integration
 from voxonta_matrix.matrix import MatrixClient
+from voxonta_matrix.room_access import RoomAccess
 from voxonta_matrix.store import PostgresStore
 from voxonta_matrix.widget import Widget
-from voxonta_matrix.widget_store import PostgresWidgetStore
 from voxonta_matrix.widget_http import widget_app
-from voxonta_matrix.room_access import RoomAccess
+from voxonta_matrix.widget_store import PostgresWidgetStore
 
 logger = logging.getLogger("voxonta_matrix")
 
