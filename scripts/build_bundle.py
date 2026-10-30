@@ -55,6 +55,8 @@ def main():
         source = Path(temp) / "source"
         source.mkdir()
         archive(ROOT, own_ref, source)
+        if (source / "deploy" / "capture.ref").read_text().strip() != CAPTURE_REF:
+            raise ValueError("commit deploy/capture.ref before building a distribution")
         package = Path(temp) / f"voxonta-{PRODUCT}"
         package.mkdir()
         for name in ("compose.yaml", ".env.example", "README.md", "capture.ref"):
