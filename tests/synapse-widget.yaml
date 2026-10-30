@@ -1,0 +1,35 @@
+server_name: probe.test
+public_baseurl: http://localhost:18770/
+pid_file: /data/homeserver.pid
+listeners:
+  - port: 8008
+    tls: false
+    type: http
+    resources:
+      - names: [client, federation]
+        compress: false
+database:
+  name: sqlite3
+  args:
+    database: /data/homeserver.db
+media_store_path: /data/media
+signing_key_path: /data/probe.signing.key
+report_stats: false
+enable_registration: true
+enable_registration_without_verification: true
+macaroon_secret_key: local-disposable-implementation-probe
+form_secret: local-disposable-implementation-probe
+rc_registration:
+  per_second: 100
+  burst_count: 100
+rc_message:
+  per_second: 100
+  burst_count: 100
+modules:
+  - module: voxonta_widget_adapter.VoxontaWidgetAdapter
+    config:
+      token: local-disposable-adapter-test-token-only
+      widget_url: https://voxonta.example/widget/?roomId=$matrix_room_id
+      auto_install: true
+experimental_features:
+  msc4354_enabled: true

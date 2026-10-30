@@ -10,6 +10,7 @@
 
 Separate ports so that publishing one can never expose the other.
 """
+
 from __future__ import annotations
 
 import hmac
@@ -31,6 +32,7 @@ def _same(given: str, expected: str) -> bool:
 
 # ── for the homeserver ────────────────────────────────────────────────
 
+
 def appservice_app(integration, hs_token: str) -> web.Application:
     def authorized(request: web.Request) -> web.Response | None:
         """None when the homeserver proved itself, else the refusal to send.
@@ -39,8 +41,9 @@ def appservice_app(integration, hs_token: str) -> web.Application:
         query string, which is still accepted.
         """
         header = request.headers.get("Authorization", "")
-        token = header[7:] if header.startswith("Bearer ") else request.query.get(
-            "access_token", "")
+        token = (
+            header[7:] if header.startswith("Bearer ") else request.query.get("access_token", "")
+        )
         if not token:
             return web.json_response({"errcode": "M_UNAUTHORIZED"}, status=401)
         if not _same(token, hs_token):
@@ -56,8 +59,7 @@ def appservice_app(integration, hs_token: str) -> web.Application:
             await integration.on_transaction(request.match_info["txn_id"], events)
         except TryAgain as e:
             # Not acknowledged: the homeserver backs off and sends it again.
-            logger.warning("transaction %s deferred: %s", request.match_info["txn_id"],
-                           e.__cause__)
+            logger.warning("transaction %s deferred: %s", request.match_info["txn_id"], e.__cause__)
             return web.json_response({"errcode": "M_UNKNOWN"}, status=503)
         return web.json_response({})
 
@@ -90,15 +92,19 @@ def appservice_app(integration, hs_token: str) -> web.Application:
 
 # ── for the capture service ───────────────────────────────────────────
 
-def service_app(integration, service_token: str, clock=time.time) -> web.Application:
+
+def service_app(integration, service_token: str, clock=time.time, widget=None) -> web.Application:
     seen: dict[str, object] = {}
 
     def authorized(request: web.Request) -> bool:
         # Both header forms, as the Nextcloud app accepts them: some proxies
         # strip Authorization, and the capture service sends both.
         header = request.headers.get("Authorization", "")
-        token = header[7:] if header.startswith("Bearer ") else request.headers.get(
-            "X-Transcription-Token", "")
+        token = (
+            header[7:]
+            if header.startswith("Bearer ")
+            else request.headers.get("X-Transcription-Token", "")
+        )
         return _same(token, service_token)
 
     def refuse() -> web.Response:
@@ -128,7 +134,13 @@ def service_app(integration, service_token: str, clock=time.time) -> web.Applica
         # A poll is the capture service checking in too. The heartbeat alone
         # comes once a minute, which made "not seen for 30 s" a false alarm.
         seen["at"] = clock()
-        return web.json_response({"calls": integration.calls_listing()})
+        calls = integration.calls_listing()
+        if widget:
+            managed = await widget.managed_rooms()
+            calls = [c for c in calls if c["token"] not in managed]
+            if request.headers.get("X-Voxonta-Capture-Protocol") == "widget-v1":
+                calls += await widget.calls_listing()
+        return web.json_response({"calls": calls})
 
     async def heartbeat(request: web.Request) -> web.Response:
         if not authorized(request):
@@ -146,14 +158,37 @@ def service_app(integration, service_token: str, clock=time.time) -> web.Applica
     async def health(request: web.Request) -> web.Response:
         # For the deployment's own monitoring; says nothing a caller could use.
         at = seen.get("at")
-        return web.json_response({
+        data = {
             "status": "ok",
             "rooms": len(integration.rooms),
             "calls": len(integration.calls),
             "capture_seen_s_ago": None if at is None else int(clock() - at),
-        })
+        }
+        if widget:
+            data.update(
+                widget_rooms=len(await widget.managed_rooms()),
+                widget_calls=len(await widget.calls_listing()),
+                widget_capture_seen_s_ago=(
+                    None if seen.get("widget_at") is None else int(clock() - seen["widget_at"])
+                ),
+            )
+        return web.json_response(data)
 
-    app = web.Application()
+    async def capture(request):
+        if not authorized(request):
+            return refuse()
+        if widget is None:
+            raise web.HTTPNotFound()
+        body = await request.json()
+        reports = body.get("reports")
+        if not isinstance(reports, list):
+            raise web.HTTPBadRequest()
+        await widget.report(reports)
+        seen["widget_at"] = clock()
+        return web.json_response({"ok": True})
+
+    app = web.Application(client_max_size=65536)
+    app.router.add_post(SERVICE_PREFIX + "/capture", capture)
     app.router.add_get(SERVICE_PREFIX + "/config", config)
     app.router.add_get(SERVICE_PREFIX + "/calls", calls)
     app.router.add_post(SERVICE_PREFIX + "/heartbeat", heartbeat)

@@ -96,6 +96,9 @@ class Integration:
         id; one that ended meanwhile is ended after the grace period, as if its
         last device had just left.
         """
+        if not self.config.bot_mode_enabled:
+            self._ready.set()
+            return
         async with self._lock:
             await self.matrix.ensure_bot(self.config.bot_displayname)
             self.calls = {c.room_id: c for c in await self.store.load_calls()}
@@ -112,6 +115,9 @@ class Integration:
         self._ready.set()
 
     async def _read_room(self, room_id: str) -> None:
+        widget = getattr(self, "widget", None)
+        if widget and room_id in await widget.managed_rooms():
+            return
         try:
             state = await self.matrix.room_state(room_id)
         except Exception as e:
@@ -178,6 +184,9 @@ class Integration:
 
     async def _on_event(self, event: dict) -> None:
         room_id = event.get("room_id")
+        widget = getattr(self, "widget", None)
+        if widget and room_id in await widget.managed_rooms():
+            return
         if not room_id:
             return
         if event.get("type") == "m.room.member" and event.get("state_key") == self.bot:
@@ -248,7 +257,11 @@ class Integration:
     async def _reconcile(self) -> None:
         now = self._clock()
         now_ms = int(now * 1000)
+        widget = getattr(self, "widget", None)
+        managed = await widget.managed_rooms() if widget else set()
         for room_id, room in self.rooms.items():
+            if room_id in managed:
+                continue
             active = room.active(now_ms)
             call = self.calls.get(room_id)
             if not active:
