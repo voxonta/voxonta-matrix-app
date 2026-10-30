@@ -84,6 +84,9 @@ class Delivery:
         and reopen finished ones that have files again."""
         adopted = reopened = 0
         for row in await self.gateway.undelivered([SOURCE]):
+            widget = getattr(self, "widget", None)
+            if widget and row.get("room_token") in await widget.managed_rooms():
+                continue
             session_id = str(row["session_id"])
             if row.get("source") != SOURCE or self._is_live(session_id):
                 # Another platform's (a gateway that ignored the filter), or a

@@ -194,3 +194,13 @@ more test polls this service with the capture service's own client.
 ## Licence
 
 MIT.
+
+## Standalone Voxonta widget (opt-in)
+
+A separate `voxonta` widget controls transcription without inviting a bot into
+Matrix rooms. It has no dependency on a video recorder. Administrators explicitly
+start/pause/resume/finish; results and opt-in publication survive closing the
+panel and service restarts. See [installation, protocol and migration](docs/widget.md).
+`WIDGET_ENABLED` defaults to false. This mode requires the new `widget-v1` capture
+protocol and the version-pinned Synapse adapter; the released 0.3.2 capture does
+not support it. Production acceptance in Element Web/Desktop is still required.

@@ -63,3 +63,27 @@ jobs:
           out=$(docker run --rm voxonta-matrix-app:ci 2>&1 || true)
           echo "$out"
           echo "$out" | grep -q "required but not set: MATRIX_HOMESERVER_URL"
+
+  synapse-widget:
+    name: Standalone widget adapter (real Synapse)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - name: Start disposable homeserver
+        run: |
+          mkdir -p /tmp/voxonta-widget-test
+          chmod 777 /tmp/voxonta-widget-test
+          cp tests/synapse-widget.yaml /tmp/voxonta-widget-test/homeserver.yaml
+          cp synapse/voxonta_widget_adapter.py /tmp/voxonta-widget-test/
+          docker run -d --name voxonta-widget-test -p 127.0.0.1:18770:8008 \
+            -v /tmp/voxonta-widget-test:/data -e PYTHONPATH=/data \
+            matrixdotorg/synapse:v1.163.2
+      - name: Exercise adapter without a bot
+        run: python3 tests/synapse_widget_e2e.py
+      - name: Homeserver logs on failure
+        if: failure()
+        run: docker logs --tail 100 voxonta-widget-test
+      - name: Clean up
+        if: always()
+        run: docker rm -f voxonta-widget-test
