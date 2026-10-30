@@ -219,3 +219,12 @@ Maintainers build from a committed tree with
 `python3 scripts/build_bundle.py --capture-source <capture-checkout>`.
 The commit in `deploy/capture.ref` must exist in that checkout. Real `.env`,
 untracked files and local credentials are excluded from the distribution.
+
+
+Room administrators can enable automatic transcription of new calls and automatic
+publication separately in the standalone widget. Installation presets
+`WIDGET_AUTO_TRANSCRIBE_DEFAULT=true` and `WIDGET_AUTO_PUBLISH_DEFAULT=true`
+apply on first room enrollment via the Synapse adapter, without opening the widget.
+Both default to false. Per-room overrides survive restarts and are never reset
+by presets. Update the adapter together with this feature; 0.3.0 does not yet
+support these settings. See docs/widget.md for discovery/backfill and lifecycle.

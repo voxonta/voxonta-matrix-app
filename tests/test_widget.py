@@ -28,6 +28,11 @@ class Access:
         self.down = False
         self.sent = {}
 
+    async def rooms(self):
+        if self.down:
+            raise AccessUnavailable("offline")
+        return [{"room_id": ROOM, "sender": ALICE}] if self.installed else []
+
     async def snapshot(self, room, now):
         if self.down:
             raise AccessUnavailable("offline")

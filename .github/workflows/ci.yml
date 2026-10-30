@@ -79,8 +79,13 @@ jobs:
           docker run -d --name voxonta-widget-test -p 127.0.0.1:18770:8008 \
             -v /tmp/voxonta-widget-test:/data -e PYTHONPATH=/data \
             matrixdotorg/synapse:v1.163.2
-      - name: Exercise adapter without a bot
-        run: python3 tests/synapse_widget_e2e.py
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Install integration for automatic-flow check
+        run: pip install -e '.[dev]'
+      - name: Exercise adapter and automatic flow without a bot or open widget
+        run: PYTHONPATH=src:tests python3 tests/synapse_auto_e2e.py
       - name: Homeserver logs on failure
         if: failure()
         run: docker logs --tail 100 voxonta-widget-test

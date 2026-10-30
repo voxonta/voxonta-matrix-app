@@ -56,6 +56,21 @@ def test_postgres_serializes_two_replicas_and_preserves_commands_after_restart()
                         assert "content" not in artifact
                     await restarted.tick()
                     assert s.gw.acked
+                    s.access.room.memberships.clear()
+                    await restarted.command(ROOM, ALICE, "auto_transcribe", "enable-auto", True)
+                    await restarted.command(ROOM, ALICE, "settings", "enable-publish", True)
+                    another = Widget(
+                        s.w.config, PostgresWidgetStore(pool), s.access, s.gw, clock=s.clock
+                    )
+                    status = await another.status(ROOM, BOB)
+                    assert status["auto_transcribe"] and status["auto_publish"]
+                    from conftest import device
+
+                    s.access.room.apply(device(ALICE, "AUTO", created_s=s.clock()))
+                    await asyncio.gather(restarted.tick(), another.tick())
+                    [automatic] = await another.calls_listing()
+                    assert automatic["session_id"] != sid
+
             finally:
                 async with admin.connection() as conn:
                     await conn.execute(f"DROP SCHEMA {schema} CASCADE")

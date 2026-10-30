@@ -6,6 +6,7 @@ import asyncio
 import base64
 import copy
 import hashlib
+import logging
 import time
 import uuid
 from urllib.parse import urlencode
@@ -16,6 +17,8 @@ from voxonta_matrix.publication import choose
 from voxonta_matrix.room_access import AccessUnavailable
 from voxonta_matrix.rtc import livekit_room
 
+logger = logging.getLogger(__name__)
+
 LEASE_S = 4
 REPORT_TTL_S = 4
 MAX_FILE_BYTES = 4 * 1024 * 1024
@@ -25,6 +28,7 @@ class Widget:
     def __init__(self, config, store, access, gateway, *, clock=time.time, legacy=None):
         self.config, self.store, self.access, self.gateway = config, store, access, gateway
         self.clock, self.legacy = clock, legacy
+        self._discovery_warning_at = float("-inf")
 
     async def authorize(self, room_id, user, *, admin=False):
         room, installed = await self.access.snapshot(room_id, self.clock())
@@ -35,7 +39,16 @@ class Widget:
         return room
 
     async def command(self, room_id, user, action, request_id, value=None):
-        if action not in {"start", "pause", "resume", "finish", "settings", "publish", "revoke"}:
+        if action not in {
+            "start",
+            "pause",
+            "resume",
+            "finish",
+            "settings",
+            "auto_transcribe",
+            "publish",
+            "revoke",
+        }:
             raise ValueError("Неизвестное действие")
         if not isinstance(request_id, str) or not 1 <= len(request_id) <= 100:
             raise ValueError("Нужен request_id")
@@ -53,37 +66,41 @@ class Widget:
             if self.legacy and room_id in self.legacy.calls:
                 raise ValueError("Сначала завершите встречу в режиме бота")
             record = state["rooms"].setdefault(
-                room_id, {"settings": {}, "meetings": [], "call": None}
+                room_id,
+                {
+                    "settings": {},
+                    "meetings": [],
+                    "call": None,
+                    "auto_transcribe": self.config.widget_auto_transcribe_default,
+                    "auto_publish": self.config.widget_auto_publish_default,
+                    "configured_by": user,
+                    "publication_by": user,
+                    "rtc_live": bool(room.active(int(now * 1000))),
+                    "rtc_empty_since": None,
+                },
             )
             call = record["call"]
             if action == "settings":
                 if not isinstance(value, bool):
                     raise ValueError("Настройка должна быть true или false")
-                record["settings"][user] = value
+                record["settings"][user] = value  # Preserve existing personal preferences.
+                record["auto_publish"], record["publication_by"] = value, user
+            elif action == "auto_transcribe":
+                if not isinstance(value, bool):
+                    raise ValueError("Настройка должна быть true или false")
+                record["auto_transcribe"], record["configured_by"] = value, user
+                # A policy change never silently starts the call already on air.
+                record["rtc_live"] = bool(room.active(int(now * 1000)))
+                record["rtc_empty_since"] = None
             elif action == "start":
                 if call is None:
                     if room.encrypted:
                         raise ValueError("Зашифрованные звонки пока не поддерживаются")
                     if not room.active(int(now * 1000)):
                         raise ValueError("Сначала войдите в звонок")
-                    call = {
-                        "session_id": str(uuid.uuid4()),
-                        "room_id": room_id,
-                        "started_at": int(now),
-                        "revision": 1,
-                        "recording": True,
-                        "initiator": user,
-                        "auto_publish": record["settings"].get(user, False),
-                        "members": {},
-                        "audience": [{"id": u, "name": n} for u, n in room.members.items()],
-                        "empty_since": None,
-                        "ended_at": None,
-                        "artifacts": {},
-                        "delivery_status": "off",
-                        "phase": "starting",
-                        "name": room.display_name(""),
-                    }
-                    record["call"] = call
+                    call = self._new_call(record, room, user, now)
+                    record["rtc_live"] = True
+                    record["rtc_empty_since"] = None
             elif action in {"pause", "resume", "finish"}:
                 if call is None:
                     raise ValueError("Нет активной расшифровки")
@@ -131,6 +148,38 @@ class Widget:
         return result
 
     @staticmethod
+    def _new_call(record, room, user, now, *, automatic=False):
+        publisher = record.get("publication_by", user)
+        call = {
+            "session_id": str(uuid.uuid4()),
+            "automatic": automatic,
+            "room_id": room.room_id,
+            "started_at": int(now),
+            "revision": 1,
+            "recording": True,
+            "initiator": user,
+            "publisher": publisher,
+            "auto_publish": record.get("auto_publish", record["settings"].get(user, False))
+            and publisher in room.members,
+            "members": {},
+            "audience": [{"id": u, "name": n} for u, n in room.members.items()],
+            "empty_since": None,
+            "ended_at": None,
+            "artifacts": {},
+            "delivery_status": "off",
+            "phase": "starting",
+            "name": room.display_name(""),
+        }
+        record["call"] = call
+        logger.info(
+            "%s transcription started in %s [%s]",
+            "automatic" if automatic else "manual",
+            room.room_id,
+            call["session_id"][:8],
+        )
+        return call
+
+    @staticmethod
     def _end(record, now):
         call = record["call"]
         call["ended_at"], call["recording"], call["phase"] = int(now), False, "processing"
@@ -174,9 +223,14 @@ class Widget:
                 if shown is None
                 else {k: shown[k] for k in ("session_id", "phase", "revision")},
                 "can_revoke_call": bool(
-                    call and call.get("initiator") == user and call["auto_publish"]
+                    call
+                    and user in {call.get("initiator"), call.get("publisher")}
+                    and call["auto_publish"]
                 ),
-                "auto_publish": record.get("settings", {}).get(user, False),
+                "auto_publish": record.get(
+                    "auto_publish", record.get("settings", {}).get(user, False)
+                ),
+                "auto_transcribe": record.get("auto_transcribe", False),
                 "meetings": meetings,
             }
 
@@ -192,12 +246,73 @@ class Widget:
             except (AccessUnavailable, PermissionError, TimeoutError):
                 return room_id, None
 
+        discovered = []
+        if self.config.widget_auto_transcribe_default or self.config.widget_auto_publish_default:
+            try:
+                discovered = await asyncio.wait_for(self.access.rooms(), 1.5)
+            except (AccessUnavailable, PermissionError, TimeoutError) as error:
+                if now - self._discovery_warning_at >= 60:
+                    logger.warning("automatic room discovery unavailable: %s", error)
+                    self._discovery_warning_at = now
+        discovered = {
+            r["room_id"]: r
+            for r in discovered
+            if isinstance(r, dict) and isinstance(r.get("room_id"), str)
+        }
+        room_ids = list(set(room_ids) | discovered.keys())
         snapshots = dict(await asyncio.gather(*(snapshot(r) for r in room_ids)))
         async with self.store.transaction() as state:
+            for room_id, metadata in discovered.items():
+                if self.legacy and room_id in self.legacy.calls:
+                    continue  # Never take over a live bot-mode meeting.
+                if room_id in state["rooms"] or snapshots.get(room_id) is None:
+                    continue
+                room, installed = snapshots[room_id]
+                actor = metadata.get("sender")
+                if not installed or actor not in room.members or not room.is_admin(actor):
+                    continue
+                # If the widget was installed in a call already in progress,
+                # defaults take effect at its next instance, not midway through.
+                already_live = bool(
+                    room.active(int(now * 1000))
+                    and getattr(room, "rtc_started_at", now) < getattr(room, "widget_added_at", 0)
+                )
+                state["rooms"][room_id] = {
+                    "settings": {},
+                    "meetings": [],
+                    "call": None,
+                    "auto_transcribe": self.config.widget_auto_transcribe_default,
+                    "auto_publish": self.config.widget_auto_publish_default,
+                    "configured_by": actor,
+                    "publication_by": actor,
+                    "rtc_live": already_live,
+                    "rtc_empty_since": None,
+                }
             for room_id, record in state["rooms"].items():
                 if snapshots.get(room_id) is None:
                     continue
                 room, installed = snapshots[room_id]
+                if not installed:
+                    record["auto_transcribe"] = False
+                active = room.active(int(now * 1000))
+                if not active:
+                    if record.get("rtc_empty_since") is None:
+                        record["rtc_empty_since"] = now
+                    if now - record["rtc_empty_since"] >= self.config.call_end_grace_s:
+                        record["rtc_live"] = False
+                else:
+                    record["rtc_empty_since"] = None
+                    if not record.get("rtc_live", bool(record["call"])):
+                        record["rtc_live"] = True
+                        if (
+                            installed
+                            and not room.encrypted
+                            and record.get("auto_transcribe")
+                            and record["call"] is None
+                        ):
+                            self._new_call(
+                                record, room, record["configured_by"], now, automatic=True
+                            )
                 call = record["call"]
                 if call and call.get("finishing"):
                     report = state["reports"].get(call["session_id"], {})
@@ -217,6 +332,7 @@ class Widget:
                     call["audience"] = [{"id": u, "name": n} for u, n in room.members.items()]
                     active = room.active(int(now * 1000))
                     if not installed:
+                        record["auto_transcribe"] = False
                         self._end(record, now)
                         record["capture"] = None
                     elif not active:
@@ -361,7 +477,7 @@ class Widget:
                         and meeting["auto_publish"]
                         and meeting["delivery_status"] == "off"
                     ):
-                        meeting["publisher"] = meeting["initiator"]
+                        meeting["publisher"] = meeting.get("publisher", meeting["initiator"])
                         meeting["delivery_status"] = "pending"
         except UnknownMeeting:
             if now - meeting["ended_at"] > 86400:

@@ -77,6 +77,8 @@ class Config:
     # Standalone widget is opt-in. Bot mode retains its existing defaults.
     bot_mode_enabled: bool = True
     widget_enabled: bool = False
+    widget_auto_transcribe_default: bool = False
+    widget_auto_publish_default: bool = False
     widget_public_url: str = ""
     widget_session_secret: str = ""
     widget_parent_origins: tuple[str, ...] = ()
@@ -133,6 +135,12 @@ class Config:
         return cls(
             bot_mode_enabled=bot_mode,
             widget_enabled=enabled,
+            widget_auto_transcribe_default=env.get(
+                "WIDGET_AUTO_TRANSCRIBE_DEFAULT", "false"
+            ).lower()
+            == "true",
+            widget_auto_publish_default=env.get("WIDGET_AUTO_PUBLISH_DEFAULT", "false").lower()
+            == "true",
             widget_public_url=env.get("WIDGET_PUBLIC_URL", "").rstrip("/"),
             widget_session_secret=env.get("WIDGET_SESSION_SECRET", ""),
             widget_parent_origins=tuple(env.get("WIDGET_PARENT_ORIGINS", "").split()),

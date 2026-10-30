@@ -5,7 +5,7 @@ from __future__ import annotations
 import aiohttp
 
 from voxonta_matrix.rooms import Room
-from voxonta_matrix.rtc import RTC_MEMBER_TYPES
+from voxonta_matrix.rtc import RTC_MEMBER_TYPES, parse_legacy_member, parse_rtc_member
 
 
 class AccessUnavailable(Exception):
@@ -34,6 +34,12 @@ class RoomAccess:
         except (aiohttp.ClientError, TimeoutError, ValueError) as e:
             raise AccessUnavailable("Адаптер Matrix недоступен") from e
 
+    async def rooms(self):
+        data = await self.request("rooms")
+        if not isinstance(data.get("rooms"), list):
+            raise AccessUnavailable("Неверный список комнат адаптера")
+        return data["rooms"]
+
     async def snapshot(self, room_id, now):
         data = await self.request("snapshot", room_id=room_id)
         room = Room(room_id)
@@ -42,6 +48,21 @@ class RoomAccess:
         for event in data.get("rtc", []):
             if event.get("type") in RTC_MEMBER_TYPES:
                 room.apply_rtc(event, int(now * 1000))
+        room.widget_added_at = data.get("widget_added_at", 0) / 1000
+        starts = []
+        for event in [*data["state"], *data.get("rtc", [])]:
+            if event.get("type") == "org.matrix.msc3401.call.member":
+                membership = parse_legacy_member(event)
+            elif event.get("type") in RTC_MEMBER_TYPES:
+                entry = parse_rtc_member(event, int(now * 1000))
+                membership = entry.membership if entry else None
+            else:
+                continue
+            if membership and membership.active(int(now * 1000)):
+                starts.append(
+                    event.get("content", {}).get("created_ts") or event.get("origin_server_ts", 0)
+                )
+        room.rtc_started_at = min(starts, default=0) / 1000
         return room, data["widget"]
 
     async def publish(self, room_id, sender, meeting_id, links):

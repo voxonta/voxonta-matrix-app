@@ -24,6 +24,7 @@ function render(s){
  $('start').hidden=!!c;$('start').disabled=busy||!s.can_control;
  $('pause').hidden=!c;$('pause').disabled=busy||!s.can_control||['starting','stopping','unknown'].includes(phase);$('pause').textContent=phase==='paused'?'Продолжить':'Приостановить';
  $('finish').hidden=!c;$('finish').disabled=busy||!s.can_control;
+ $('auto-transcribe').disabled=busy||!s.can_control;$('auto-transcribe').checked=s.auto_transcribe;
  $('revoke').hidden=!s.can_revoke_call;$('revoke').disabled=busy;$('auto').disabled=busy||!s.can_control;$('auto').checked=s.auto_publish;
  const host=$('meetings');host.replaceChildren();
  if(!s.meetings.length){const p=document.createElement('p');p.textContent='Готовые саммари и расшифровки появятся здесь.';host.append(p);}
@@ -35,14 +36,17 @@ function render(s){
  }
 }
 async function refresh(){try{if(Date.now()>expires)await login();render(await api('status'));error(null);}catch(e){error(e);$('retry').hidden=false;}}
-async function command(action,value){if(busy)return;busy=true;error(null);if(current)render(current);
+async function command(action,value){if(busy)return;const before=current;
+ if(current&&action==='auto_transcribe')current={...current,auto_transcribe:value};
+ if(current&&action==='settings')current={...current,auto_publish:value};
+ busy=true;error(null);if(current)render(current);
  // Preserve idempotency key after a lost response until this exact command succeeds.
  if(!pendingCommand||pendingCommand.action!==action||pendingCommand.value!==value)pendingCommand={action,value,request_id:crypto.randomUUID()};
- try{await api('command',pendingCommand);pendingCommand=null;await refresh();}catch(e){error(e);}finally{busy=false;if(current)render(current);}}
+ try{await api('command',pendingCommand);pendingCommand=null;await refresh();}catch(e){current=before;error(e);}finally{busy=false;if(current)render(current);}}
 async function download(session_id,kind){try{const blob=await api('result',{session_id,kind});$('viewer-title').textContent=kind==='summary'?'Саммари':'Расшифровка';$('viewer-content').textContent=await blob.text();$('viewer').hidden=false;$('viewer').scrollIntoView({block:'start'});}catch(e){error(e);}}
 $('close-viewer').onclick=()=>{$('viewer').hidden=true;$('viewer-content').textContent='';};
 $('revoke').onclick=()=>command('revoke',current.call.session_id);
-$('start').onclick=()=>command('start');$('pause').onclick=()=>command(current.call.phase==='paused'?'resume':'pause');$('finish').onclick=()=>command('finish');$('auto').onchange=()=>command('settings',$('auto').checked);$('retry').onclick=refresh;
+$('start').onclick=()=>command('start');$('pause').onclick=()=>command(current.call.phase==='paused'?'resume':'pause');$('finish').onclick=()=>command('finish');$('auto-transcribe').onchange=()=>command('auto_transcribe',$('auto-transcribe').checked);$('auto').onchange=()=>command('settings',$('auto').checked);$('retry').onclick=refresh;
 widget.on('ready',()=>{void refresh();setInterval(refresh,2000);});widget.start();setTimeout(()=>{if(!token){error(new Error('Откройте виджет Voxonta из комнаты Element.'));$('retry').hidden=false;}},15000);
 
 }
