@@ -32,9 +32,14 @@ def archive(repo, ref, destination):
                 not target.resolve().is_relative_to(destination.resolve())
                 or member.issym()
                 or member.islnk()
+                or not (member.isfile() or member.isdir())
             ):
                 raise ValueError("unsafe source archive")
-        source.extractall(destination, filter="data")
+        if hasattr(tarfile, "data_filter"):
+            source.extractall(destination, filter="data")
+        else:
+            # Python 3.9/early 3.11: all paths/types/links were validated above.
+            source.extractall(destination)
 
 
 def main():
