@@ -43,7 +43,7 @@ jobs:
           pip install 'nextcloud-talk-capture @ git+https://github.com/voxonta/nextcloud-talk-capture@main'
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests scripts
 
       - name: Test
         env:
@@ -109,6 +109,7 @@ jobs:
           tar -xzf dist/voxonta-matrix-*.tar.gz -C /tmp/voxonta-matrix-install
           python3 scripts/check_bundle.py /tmp/voxonta-matrix-install/voxonta-matrix
           docker build -t voxonta-matrix-capture:ci /tmp/voxonta-matrix-install/voxonta-matrix/capture
+          docker run --rm --entrypoint python voxonta-matrix-capture:ci -c "import runpy; from livekit import rtc; runpy.run_path('/app/src/main.py', run_name='package_test')"
       - uses: actions/upload-artifact@v4
         with:
           name: voxonta-matrix-installation

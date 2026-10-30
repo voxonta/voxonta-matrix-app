@@ -84,6 +84,10 @@ def main():
                 shutil.copy2(source / item, integration / item)
             shutil.copy2(source / "synapse" / "voxonta_widget_adapter.py", package)
         else:
+            with tarfile.open(args.app_archive) as app:
+                info = app.extractfile("voxonta/appinfo/info.xml")
+                if info is None or b"<id>voxonta</id>" not in info.read():
+                    raise ValueError("not a Voxonta Nextcloud application archive")
             shutil.copy2(args.app_archive, package / "voxonta-app.tar.gz")
         manifest = {
             "product": f"voxonta-{PRODUCT}",
