@@ -36,11 +36,17 @@ class VoxontaWidgetAdapter:
                 raise ValueError(f"{key} is required")
         if len(config["token"]) < 32:
             raise ValueError("adapter token must have at least 32 characters")
+        rooms = config.get("backfill_rooms", [])
+        if not isinstance(rooms, list) or any(
+            not isinstance(r, str) or not r.startswith("!") for r in rooms
+        ):
+            raise ValueError("backfill_rooms must be room IDs")
         return config
 
     def __init__(self, config, api):
         self.api, self.config = api, config
         self.key = config.get("widget_key", "voxonta")
+        self.backfilled = False
         api.register_third_party_rules_callbacks(
             on_new_event=self.on_event,
             on_create_room=self.on_create_room,
@@ -57,6 +63,11 @@ class VoxontaWidgetAdapter:
             txn.execute(
                 "CREATE TABLE IF NOT EXISTS voxonta_widget_delivery "
                 "(operation TEXT PRIMARY KEY, created BIGINT NOT NULL, event_id TEXT)"
+            )
+
+            txn.execute(
+                "CREATE TABLE IF NOT EXISTS voxonta_widget_rooms "
+                "(room_id TEXT PRIMARY KEY, sender TEXT NOT NULL, installed_at BIGINT NOT NULL)"
             )
 
         await self.api.run_db_interaction("voxonta_schema", create)
@@ -98,7 +109,48 @@ class VoxontaWidgetAdapter:
             )
         config["initial_state"] = initial
 
+    async def remember_room(self, room_id, widget):
+        await self.schema()
+
+        def save(txn):
+            if widget and widget.content.get("url") == self.config["widget_url"]:
+                txn.execute(
+                    "INSERT INTO voxonta_widget_rooms VALUES (?, ?, ?) "
+                    "ON CONFLICT (room_id) DO UPDATE SET sender=excluded.sender, installed_at=excluded.installed_at",
+                    (room_id, widget.sender, widget.origin_server_ts),
+                )
+            else:
+                txn.execute("DELETE FROM voxonta_widget_rooms WHERE room_id=?", (room_id,))
+
+        await self.api.run_db_interaction("voxonta_widget_room", save)
+
+    async def rooms(self):
+        await self.schema()
+        if not self.backfilled:
+            for room_id in self.config.get("backfill_rooms", []):
+                state = await self.api.get_room_state(room_id)
+                await self.remember_room(
+                    room_id, state.get(("im.vector.modular.widgets", self.key))
+                )
+            self.backfilled = True
+
+        def read(txn):
+            txn.execute(
+                "SELECT room_id, sender, installed_at FROM voxonta_widget_rooms ORDER BY room_id"
+            )
+            return [{"room_id": r[0], "sender": r[1], "installed_at": r[2]} for r in txn.fetchall()]
+
+        return await self.api.run_db_interaction("voxonta_widget_rooms", read)
+
     async def on_event(self, event, state):
+        if (
+            event.type in RTC
+            or event.type == "org.matrix.msc3401.call.member"
+            or (event.type == "im.vector.modular.widgets" and event.state_key == self.key)
+        ):
+            await self.remember_room(
+                event.room_id, state.get(("im.vector.modular.widgets", self.key))
+            )
         if event.type not in RTC or not self.installed(state):
             return
         await self.schema()
@@ -219,6 +271,8 @@ class Endpoint(DirectServeJsonResource):
         ):
             raise SynapseError(403, "forbidden")
         body = parse_json_object_from_request(request)
+        if body.get("action") == "rooms":
+            return 200, {"rooms": await self.adapter.rooms()}
         room_id = body.get("room_id")
         if not isinstance(room_id, str) or not room_id.startswith("!") or len(room_id) > 255:
             raise SynapseError(400, "invalid room")
@@ -227,6 +281,11 @@ class Endpoint(DirectServeJsonResource):
         if body.get("action") == "snapshot":
             return 200, {
                 "widget": installed,
+                "widget_added_at": (
+                    state[("im.vector.modular.widgets", self.adapter.key)].origin_server_ts
+                    if installed
+                    else 0
+                ),
                 "state": [e.get_dict() for (t, _), e in state.items() if t in TYPES],
                 "rtc": recent,
             }

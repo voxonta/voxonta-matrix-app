@@ -161,3 +161,20 @@ print(
 if os.environ.get("VOXONTA_E2E_CONTEXT"):
     with open(os.environ["VOXONTA_E2E_CONTEXT"], "w") as output:
         json.dump({"room_id": room, "rtc_event_id": rtc_event["event_id"]}, output)
+
+# Discovery works with the widget closed, and its removal revokes enrollment.
+rooms = ok("POST", ADAPTER, {"action": "rooms"}, T)["rooms"]
+assert room not in {r["room_id"] for r in rooms}
+ok(
+    "PUT",
+    path + "/state/im.vector.modular.widgets/voxonta",
+    {
+        "id": "voxonta",
+        "type": "m.custom",
+        "url": "https://voxonta.example/widget/?roomId=$matrix_room_id",
+    },
+    at,
+)
+rooms = ok("POST", ADAPTER, {"action": "rooms"}, T)["rooms"]
+assert next(r for r in rooms if r["room_id"] == room)["sender"] == a["user_id"]
+print("Widget room discovery without a UI session: PASS")
