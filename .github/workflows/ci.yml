@@ -43,7 +43,7 @@ jobs:
           pip install 'nextcloud-talk-capture @ git+https://github.com/voxonta/nextcloud-talk-capture@main'
 
       - name: Lint
-        run: ruff check src tests
+        run: ruff check src tests scripts
 
       - name: Test
         env:
@@ -87,3 +87,30 @@ jobs:
       - name: Clean up
         if: always()
         run: docker rm -f voxonta-widget-test
+
+  installation-bundle:
+    name: Independent Matrix installation bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read pinned capture source
+        run: echo "CAPTURE_REF=$(cat deploy/capture.ref)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          repository: voxonta/nextcloud-talk-capture
+          ref: ${{ env.CAPTURE_REF }}
+          path: .capture-source
+      - name: Assemble the whole Matrix package
+        run: python3 scripts/build_bundle.py --capture-source .capture-source
+      - name: Check Compose and build the bundled capture
+        run: |
+          mkdir /tmp/voxonta-matrix-install
+          tar -xzf dist/voxonta-matrix-*.tar.gz -C /tmp/voxonta-matrix-install
+          python3 scripts/check_bundle.py /tmp/voxonta-matrix-install/voxonta-matrix
+          docker build -t voxonta-matrix-capture:ci /tmp/voxonta-matrix-install/voxonta-matrix/capture
+          docker run --rm --entrypoint python voxonta-matrix-capture:ci -c "import runpy; from livekit import rtc; runpy.run_path('/app/src/main.py', run_name='package_test')"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: voxonta-matrix-installation
+          path: dist/*

@@ -204,3 +204,18 @@ panel and service restarts. See [installation, protocol and migration](docs/widg
 `WIDGET_ENABLED` defaults to false. This mode requires the new `widget-v1` capture
 protocol and the version-pinned Synapse adapter; the released 0.3.2 capture does
 not support it. Production acceptance in Element Web/Desktop is still required.
+
+## One installation package for Matrix
+
+Use the `voxonta-matrix-<commit>.tar.gz` installation artifact/release asset.
+It contains the integration, standalone widget, Synapse adapter, its own LiveKit
+capture worker and Postgres deployment. Extract, configure `.env` from the
+included example, install the adapter into your existing Synapse, then run
+`docker compose up -d --build`. No Nextcloud application or separate Nextcloud
+package is required. See the included README. Shared capture source is pinned
+and included inside the bundle; recipients do not clone another repository.
+
+Maintainers build from a committed tree with
+`python3 scripts/build_bundle.py --capture-source <capture-checkout>`.
+The commit in `deploy/capture.ref` must exist in that checkout. Real `.env`,
+untracked files and local credentials are excluded from the distribution.

@@ -52,3 +52,24 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.version=${{ env.VERSION }}
             org.opencontainers.image.licenses=MIT
+
+  installation-bundle:
+    name: Publish independent Matrix installation package
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Read pinned capture source
+        run: echo "CAPTURE_REF=$(cat deploy/capture.ref)" >> "$GITHUB_ENV"
+      - uses: actions/checkout@v5
+        with:
+          repository: voxonta/nextcloud-talk-capture
+          ref: ${{ env.CAPTURE_REF }}
+          path: .capture-source
+      - name: Build installation package
+        run: python3 scripts/build_bundle.py --capture-source .capture-source
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*

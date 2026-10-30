@@ -1,0 +1,57 @@
+name: voxonta-matrix
+services:
+  database:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: voxonta
+      POSTGRES_USER: voxonta
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}
+    volumes:
+      - database:/var/lib/postgresql/data
+    healthcheck:
+      test: [CMD-SHELL, 'pg_isready -U voxonta -d voxonta']
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    restart: unless-stopped
+  integration:
+    build: ./integration
+    environment:
+      DATABASE_URL: postgresql://voxonta:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD}@database:5432/voxonta
+      MATRIX_HOMESERVER_URL: ${MATRIX_HOMESERVER_URL:?Set MATRIX_HOMESERVER_URL}
+      MATRIX_SERVER_NAME: ${MATRIX_SERVER_NAME:?Set MATRIX_SERVER_NAME}
+      BOT_MODE_ENABLED: 'false'
+      WIDGET_ENABLED: 'true'
+      WIDGET_PUBLIC_URL: ${WIDGET_PUBLIC_URL:?Set WIDGET_PUBLIC_URL}
+      WIDGET_PARENT_ORIGINS: ${WIDGET_PARENT_ORIGINS:?Set WIDGET_PARENT_ORIGINS}
+      WIDGET_SESSION_SECRET: ${WIDGET_SESSION_SECRET:?Set WIDGET_SESSION_SECRET}
+      WIDGET_ADAPTER_URL: ${WIDGET_ADAPTER_URL:?Set WIDGET_ADAPTER_URL}
+      WIDGET_ADAPTER_TOKEN: ${WIDGET_ADAPTER_TOKEN:?Set WIDGET_ADAPTER_TOKEN}
+      SERVICE_TOKEN: ${SERVICE_TOKEN:?Set SERVICE_TOKEN}
+      LIVEKIT_URL: ${LIVEKIT_URL:?Set LIVEKIT_URL}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?Set LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?Set LIVEKIT_API_SECRET}
+      GATEWAY_URL: ${GATEWAY_URL:?Set GATEWAY_URL}
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:?Set GATEWAY_TOKEN}
+    ports:
+      - '127.0.0.1:${WIDGET_LOCAL_PORT:-8082}:8082'
+    depends_on:
+      database:
+        condition: service_healthy
+    restart: unless-stopped
+  capture:
+    build: ./capture
+    environment:
+      APP_BASE_URL: http://integration:8081
+      APP_SERVICE_TOKEN: ${SERVICE_TOKEN:?Set SERVICE_TOKEN}
+      GATEWAY_TARGET: ${GATEWAY_TARGET:?Set GATEWAY_TARGET}
+      GATEWAY_TLS: 'true'
+      GATEWAY_TOKEN: ${GATEWAY_TOKEN:?Set GATEWAY_TOKEN}
+      POLL_INTERVAL: '1'
+      TIMEZONE: ${TIMEZONE:-UTC}
+    depends_on:
+      integration:
+        condition: service_healthy
+    restart: unless-stopped
+volumes:
+  database:
