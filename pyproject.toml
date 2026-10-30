@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "voxonta-matrix-app"
-version = "0.3.0"
+version = "0.4.0"
 description = "Voxonta for Matrix: standalone transcription widget for Element Call"
 readme = "README.md"
 requires-python = ">=3.12"
