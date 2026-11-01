@@ -7,9 +7,10 @@ import base64
 import copy
 import hashlib
 import logging
+import re
 import time
 import uuid
-from urllib.parse import urlencode
+from datetime import UTC, datetime
 
 from voxonta_matrix.gateway import GatewayUnavailable, UnknownMeeting
 from voxonta_matrix.livekit import capture_token
@@ -508,14 +509,21 @@ class Widget:
             if not installed or publisher not in room.members:
                 meeting["delivery_status"] = "revoked"
                 return
-            base = self.config.widget_public_url.rstrip("/")
-            links = {
-                kind: base + "/?" + urlencode({"roomId": room_id, "meeting": sid, "open": kind})
-                for kind in meeting["artifacts"]
-            }
+            files = {}
+            for kind in ("summary", "transcript"):
+                artifact = meeting["artifacts"].get(kind)
+                if artifact is None:
+                    continue
+                content = artifact.get("content")
+                if content is None:
+                    content = base64.b64encode(await self.store.artifact(room_id, sid, kind)).decode()
+                date = datetime.fromtimestamp(meeting["started_at"], UTC).strftime("%Y-%m-%d")
+                name = re.sub(r'[\x00-\x1f\x7f/\\]', ' ', meeting["name"]).strip()[:100]
+                label = "Саммари" if kind == "summary" else "Расшифровка"
+                files[kind] = {"content": content, "filename": f"{date} {name} — {label}.md"}
             meeting["delivery_status"] = "sending"
         try:
-            answer = await self.access.publish(room_id, publisher, sid, links)
+            answer = await self.access.publish(room_id, publisher, sid, files)
             outcome = "posted"
         except PermissionError:
             outcome, answer = "revoked", {}

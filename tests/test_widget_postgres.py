@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import os
 import uuid
 
@@ -56,6 +57,9 @@ def test_postgres_serializes_two_replicas_and_preserves_commands_after_restart()
                         assert "content" not in artifact
                     await restarted.tick()
                     assert s.gw.acked
+                    await restarted.command(ROOM, ALICE, "publish", "publish-durable", sid)
+                    await restarted.tick()
+                    assert base64.b64decode(s.access.sent[sid]["files"]["summary"]["content"]) == b"durable"
                     s.access.room.memberships.clear()
                     await restarted.command(ROOM, ALICE, "auto_transcribe", "enable-auto", True)
                     await restarted.command(ROOM, ALICE, "settings", "enable-publish", True)

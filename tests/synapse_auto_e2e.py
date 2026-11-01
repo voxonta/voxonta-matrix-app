@@ -11,7 +11,7 @@ from urllib.parse import quote
 import aiohttp
 from conftest import FakeGateway, make_config
 
-from voxonta_matrix.room_access import RoomAccess
+from voxonta_matrix.room_access import AccessUnavailable, RoomAccess
 from voxonta_matrix.widget import Widget
 from voxonta_matrix.widget_store import MemoryWidgetStore
 
@@ -70,6 +70,52 @@ async def main():
         meeting = store.state["rooms"][room]["meetings"][0]
         assert meeting["delivery_status"] == "posted"
         assert await widget.result(room, alice["user_id"], sid, "summary") == b"Summary"
+        # Ordinary top-level file messages are discoverable by the room Files view.
+        messages = ok("GET", path + "/messages?dir=b&limit=100", token=token)["chunk"]
+        files = [e["content"] for e in messages if e["content"].get("org.voxonta.meeting") == sid]
+        assert len(files) == 2, files
+        assert all(f["msgtype"] == "m.file" and "m.relates_to" not in f for f in files)
+        assert files[0]["filename"].endswith(" — Расшифровка.md")  # newest first
+        assert files[1]["filename"].endswith(" — Саммари.md")
+        for f, expected in zip(files, (b"Transcript", b"Summary")):
+            server, media = f["url"].removeprefix("mxc://").split("/", 1)
+            async with session.get(
+                "http://127.0.0.1:18770/_matrix/client/v1/media/download/" + server + "/" + media,
+                headers={"Authorization": "Bearer " + token},
+            ) as response:
+                assert response.status == 200
+                assert await response.read() == expected
+        await access.publish(room, alice["user_id"], sid, {
+            "summary": {"content": "U3VtbWFyeQ=="},
+            "transcript": {"content": "VHJhbnNjcmlwdA=="},
+        })
+        repeated = ok("GET", path + "/messages?dir=b&limit=100", token=token)["chunk"]
+        assert len([e for e in repeated if e["content"].get("org.voxonta.meeting") == sid]) == 2
+        # Model a lost response after sending only the first file. Retrying the
+        # whole pair must complete the second without duplicating the first.
+        partial_sid = sid + "-partial"
+        await access.publish(room, alice["user_id"], partial_sid, {
+            "summary": {"content": "U3VtbWFyeQ=="},
+        })
+        await access.publish(room, alice["user_id"], partial_sid, {
+            "summary": {"content": "U3VtbWFyeQ=="},
+            "transcript": {"content": "VHJhbnNjcmlwdA=="},
+        })
+        messages = ok("GET", path + "/messages?dir=b&limit=100", token=token)["chunk"]
+        partial = [e for e in messages if e["content"].get("org.voxonta.meeting") == partial_sid]
+        assert len(partial) == 2
+        assert all(e["content"]["msgtype"] == "m.file" for e in partial)
+        # Validate the entire pair before sending anything.
+        try:
+            await access.publish(room, alice["user_id"], sid + "-invalid", {
+                "summary": {"content": "U3VtbWFyeQ=="}, "transcript": {"content": "%%%"},
+            })
+        except AccessUnavailable:
+            pass
+        else:
+            raise AssertionError("invalid file accepted")
+        messages = ok("GET", path + "/messages?dir=b&limit=100", token=token)["chunk"]
+        assert not any(e["content"].get("org.voxonta.meeting") == sid + "-invalid" for e in messages)
         snapshot = await access.request("snapshot", room_id=room)
         assert (
             len(
