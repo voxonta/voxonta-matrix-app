@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 from types import SimpleNamespace
 
@@ -38,8 +39,8 @@ class Access:
             raise AccessUnavailable("offline")
         return copy.deepcopy(self.room), self.installed
 
-    async def publish(self, room, sender, sid, links):
-        self.sent.setdefault(sid, {"event_id": "$" + sid})
+    async def publish(self, room, sender, sid, files):
+        self.sent.setdefault(sid, {"event_id": "$" + sid, "files": files})
         return self.sent[sid]
 
 
@@ -201,6 +202,10 @@ def test_auto_publish_requires_explicit_setting_and_runs_once_without_browser():
         await s.w.tick()
         await s.w.tick()
         assert list(s.access.sent) == [sid]
+        sent = s.access.sent[sid]["files"]
+        assert list(sent) == ["summary"]
+        assert base64.b64decode(sent["summary"]["content"]) == b"Summary"
+        assert sent["summary"]["filename"].endswith(" — Саммари.md")
         assert (await s.w.status(ROOM, ALICE))["meetings"][0]["delivery_status"] == "posted"
 
     asyncio.run(go())

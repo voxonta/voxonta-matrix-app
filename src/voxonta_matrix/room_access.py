@@ -24,7 +24,7 @@ class RoomAccess:
                 self.base,
                 json={"action": action, **body},
                 headers=self.headers,
-                timeout=aiohttp.ClientTimeout(total=8),
+                timeout=aiohttp.ClientTimeout(total=60 if action == "publish_files" else 8),
             ) as response:
                 if response.status == 403:
                     raise PermissionError("Доступ к комнате отозван")
@@ -65,7 +65,7 @@ class RoomAccess:
         room.rtc_started_at = min(starts, default=0) / 1000
         return room, data["widget"]
 
-    async def publish(self, room_id, sender, meeting_id, links):
+    async def publish(self, room_id, sender, meeting_id, files):
         return await self.request(
-            "publish", room_id=room_id, sender=sender, meeting_id=meeting_id, links=links
+            "publish_files", room_id=room_id, sender=sender, meeting_id=meeting_id, files=files
         )

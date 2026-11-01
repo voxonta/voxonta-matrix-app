@@ -228,3 +228,17 @@ apply on first room enrollment via the Synapse adapter, without opening the widg
 Both default to false. Per-room overrides survive restarts and are never reset
 by presets. Update the adapter together with this feature; 0.3.0 does not yet
 support these settings. See docs/widget.md for discovery/backfill and lifecycle.
+
+
+### Standalone widget result files
+
+The standalone widget publishes two top-level `m.file` messages, summary first,
+then transcript, with readable dated filenames. There is no announcement or
+thread; both attachments are available in Element's room Files view. If only
+one artifact is available, only that file is sent. Publication follows the
+existing room setting; archive access in the widget is unchanged. Already
+posted link messages are not automatically republished.
+
+This change requires updating both the integration and the Synapse adapter
+(outside active calls). The adapter still accepts older link publications for
+rolling upgrades. The legacy bot delivery described above is unchanged.

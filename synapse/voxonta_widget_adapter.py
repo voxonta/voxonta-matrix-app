@@ -5,8 +5,11 @@ and publication receipts. Sending uses a version-pinned Synapse handler because
 Module API's send method does not expose transaction ids.
 """
 
+import base64
+import binascii
 import hashlib
 import hmac
+import io
 import json
 import time
 from urllib.parse import urlsplit
@@ -14,7 +17,7 @@ from urllib.parse import urlsplit
 from synapse.api.errors import SynapseError
 from synapse.http.server import DirectServeJsonResource
 from synapse.http.servlet import parse_json_object_from_request
-from synapse.types import create_requester
+from synapse.types import UserID, create_requester
 
 TYPES = {
     "m.room.create",
@@ -188,24 +191,65 @@ class VoxontaWidgetAdapter:
 
         return state, await self.api.run_db_interaction("voxonta_recent_rtc", read)
 
-    async def publish(self, state, body):
+    async def publish_files(self, state, body):
+        files = body.get("files")
+        if not isinstance(files, dict) or not files or set(files) - {"summary", "transcript"}:
+            raise SynapseError(400, "invalid result files")
+        decoded = {}
+        for kind, item in files.items():
+            try:
+                encoded = item["content"]
+                if not isinstance(encoded, str) or len(encoded) > 5592408:
+                    raise ValueError("file too large")
+                content = base64.b64decode(encoded, validate=True)
+                if len(content) > 4 * 1024 * 1024:
+                    raise ValueError("file too large")
+                filename = item.get("filename", f"{body['meeting_id']} — {kind}.md")
+                if (
+                    not isinstance(filename, str)
+                    or len(filename) > 255
+                    or any(ord(c) < 32 or c in "/\\" for c in filename)
+                    or not filename.endswith(".md")
+                ):
+                    raise ValueError("invalid filename")
+                decoded[kind] = (content, filename)
+            except (KeyError, TypeError, ValueError, binascii.Error):
+                raise SynapseError(400, "invalid result file") from None
+        events = []
+        for kind in ("summary", "transcript"):
+            if kind in decoded:
+                events.append(
+                    await self.publish(
+                        state,
+                        body,
+                        file_kind=kind,
+                        file_content=decoded[kind][0],
+                        file_name=decoded[kind][1],
+                    )
+                )
+        return events[-1]
+
+    async def publish(self, state, body, *, file_kind=None, file_content=None, file_name=None):
         sender, sid, room_id = body["sender"], body["meeting_id"], body["room_id"]
         member = state.get(("m.room.member", sender))
         if not self.api.is_mine(sender) or not member or member.content.get("membership") != "join":
             raise SynapseError(403, "publisher no longer a local member")
-        links = body["links"]
-        expected = urlsplit(self.config["widget_url"])
-        if not isinstance(links, dict) or not links or set(links) - {"summary", "transcript"}:
-            raise SynapseError(400, "invalid result links")
-        for link in links.values():
-            u = urlsplit(link)
-            if (u.scheme, u.netloc, u.path.rstrip("/")) != (
-                expected.scheme,
-                expected.netloc,
-                expected.path.rstrip("/"),
-            ):
-                raise SynapseError(400, "result must point to this widget")
-        op = hashlib.sha256((room_id + "\0" + sid).encode()).hexdigest()
+        kind = file_kind
+        if kind is None:
+            links = body["links"]
+            expected = urlsplit(self.config["widget_url"])
+            if not isinstance(links, dict) or not links or set(links) - {"summary", "transcript"}:
+                raise SynapseError(400, "invalid result links")
+            for link in links.values():
+                u = urlsplit(link)
+                if (u.scheme, u.netloc, u.path.rstrip("/")) != (
+                    expected.scheme,
+                    expected.netloc,
+                    expected.path.rstrip("/"),
+                ):
+                    raise SynapseError(400, "result must point to this widget")
+        identity = room_id + "\0" + sid + ("\0" + kind if kind else "")
+        op = hashlib.sha256(identity.encode()).hexdigest()
         now = int(time.time())
 
         def claim(txn):
@@ -226,9 +270,29 @@ class VoxontaWidgetAdapter:
             # ambiguous old send once its deduplication guarantee may have expired.
             raise SynapseError(409, "publication needs operator reconciliation")
         labels = {"summary": "Саммари", "transcript": "Расшифровка"}
-        text = "Помощник встреч Voxonta: встреча расшифрована\n" + "\n".join(
-            f"{labels[k]}: {v}" for k, v in sorted(links.items())
-        )
+        if kind:
+            content = file_content
+            filename = file_name
+            uri = await self.api._hs.get_media_repository().create_or_update_content(
+                "text/markdown; charset=utf-8",
+                filename,
+                io.BytesIO(content),
+                len(content),
+                UserID.from_string(sender),
+            )
+            message = {
+                "msgtype": "m.file",
+                "body": filename,
+                "filename": filename,
+                "url": str(uri),
+                "info": {"mimetype": "text/markdown", "size": len(content)},
+                "org.voxonta.meeting": sid,
+            }
+        else:
+            text = "Помощник встреч Voxonta: встреча расшифрована\n" + "\n".join(
+                f"{labels[k]}: {v}" for k, v in sorted(links.items())
+            )
+            message = {"msgtype": "m.text", "body": text, "org.voxonta.meeting": sid}
         # Transaction receipts reference a real device row in Synapse. Register
         # a named service device without issuing or retaining an access token.
         await self.api._hs.get_device_handler().check_device_registered(
@@ -243,7 +307,7 @@ class VoxontaWidgetAdapter:
                 "type": "m.room.message",
                 "room_id": room_id,
                 "sender": sender,
-                "content": {"msgtype": "m.text", "body": text, "org.voxonta.meeting": sid},
+                "content": message,
             },
             txn_id="voxonta." + op,
             ratelimit=True,
@@ -289,6 +353,8 @@ class Endpoint(DirectServeJsonResource):
                 "state": [e.get_dict() for (t, _), e in state.items() if t in TYPES],
                 "rtc": recent,
             }
+        if body.get("action") == "publish_files" and installed:
+            return 200, {"event_id": await self.adapter.publish_files(state, body)}
         if body.get("action") == "publish" and installed:
             return 200, {"event_id": await self.adapter.publish(state, body)}
         raise SynapseError(403, "widget not installed or action not allowed")
