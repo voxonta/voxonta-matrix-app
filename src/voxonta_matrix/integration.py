@@ -230,9 +230,8 @@ class Integration:
         elif membership == "join":
             if room_id not in self.rooms:
                 await self._read_room(room_id)
-        elif membership in ("leave", "ban"):
-            if self.rooms.pop(room_id, None) is not None:
-                logger.info("no longer in %s (%s by %s)", room_id, membership, sender)
+        elif membership in ("leave", "ban") and self.rooms.pop(room_id, None) is not None:
+            logger.info("no longer in %s (%s by %s)", room_id, membership, sender)
 
     def _is_local(self, user_id: str) -> bool:
         return user_id.split(":", 1)[-1] == self.config.server_name
