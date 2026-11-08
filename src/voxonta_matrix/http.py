@@ -168,6 +168,7 @@ def service_app(integration, service_token: str, clock=time.time, widget=None) -
             data.update(
                 widget_rooms=len(await widget.managed_rooms()),
                 widget_calls=len(await widget.calls_listing()),
+                widget_capture_unconfirmed=await widget.unconfirmed_calls(),
                 widget_capture_seen_s_ago=(
                     None if seen.get("widget_at") is None else int(clock() - seen["widget_at"])
                 ),

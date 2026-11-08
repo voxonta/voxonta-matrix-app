@@ -34,11 +34,21 @@ class RoomAccess:
         except (aiohttp.ClientError, TimeoutError, ValueError) as e:
             raise AccessUnavailable("Адаптер Matrix недоступен") from e
 
-    async def rooms(self):
-        data = await self.request("rooms")
-        if not isinstance(data.get("rooms"), list):
-            raise AccessUnavailable("Неверный список комнат адаптера")
-        return data["rooms"]
+    async def activity(self):
+        data = await self.request("activity")
+        if not isinstance(data, dict):
+            raise AccessUnavailable("Неверный ответ адаптера о звонках")
+        installed, rooms = data.get("installed"), data.get("rooms")
+        if (
+            not isinstance(installed, list)
+            or not all(isinstance(room, str) for room in installed)
+            or not isinstance(rooms, list)
+            or not all(
+                isinstance(room, dict) and isinstance(room.get("room_id"), str) for room in rooms
+            )
+        ):
+            raise AccessUnavailable("Неверный ответ адаптера о звонках")
+        return set(installed), rooms
 
     async def snapshot(self, room_id, now):
         data = await self.request("snapshot", room_id=room_id)

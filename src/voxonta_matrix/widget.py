@@ -23,6 +23,9 @@ logger = logging.getLogger(__name__)
 LEASE_S = 4
 REPORT_TTL_S = 4
 MAX_FILE_BYTES = 4 * 1024 * 1024
+SNAPSHOT_CONCURRENCY = 16
+ROOM_STATE_TIMEOUT_S = 1.5
+CAPTURE_START_GRACE_S = 15
 
 
 class Widget:
@@ -30,6 +33,9 @@ class Widget:
         self.config, self.store, self.access, self.gateway = config, store, access, gateway
         self.clock, self.legacy = clock, legacy
         self._discovery_warning_at = float("-inf")
+        self._snapshot_warning_at = float("-inf")
+        self._snapshot_slots = asyncio.Semaphore(SNAPSHOT_CONCURRENCY)
+        self._room_tasks: dict[str, asyncio.Task] = {}
 
     async def authorize(self, room_id, user, *, admin=False):
         room, installed = await self.access.snapshot(room_id, self.clock())
@@ -235,50 +241,99 @@ class Widget:
                 "meetings": meetings,
             }
 
-    async def tick(self, *, collect=True):
+    async def tick(self, *, collect=True, wait_for_rooms=True):
         now = self.clock()
         async with self.store.transaction() as state:
-            room_ids = list(state["rooms"])
+            # Keep observed calls until their grace period has elapsed.
+            room_ids = {
+                room_id
+                for room_id, record in state["rooms"].items()
+                if record.get("call") or record.get("rtc_live")
+            }
+            auto_enabled = {
+                room_id
+                for room_id, record in state["rooms"].items()
+                if record.get("auto_transcribe")
+            }
+            state["commands"] = {
+                k: v for k, v in state["commands"].items() if now - v["at"] < 30 * 86400
+            }
 
-        async def snapshot(room_id):
-            try:
-                result = await asyncio.wait_for(self.access.snapshot(room_id, self.clock()), 1.5)
-                return room_id, result
-            except (AccessUnavailable, PermissionError, TimeoutError):
-                return room_id, None
+        # Renew existing leases even while discovery is waiting on Synapse.
+        tasks = [self._schedule_room(room_id) for room_id in room_ids]
+        try:
+            installed, activity = await asyncio.wait_for(
+                self.access.activity(), ROOM_STATE_TIMEOUT_S
+            )
+            candidates = {r["room_id"]: r for r in activity}
+            candidates_to_check = (candidates.keys() & auto_enabled) | (auto_enabled - installed)
+            defaults = (
+                self.config.widget_auto_transcribe_default
+                or self.config.widget_auto_publish_default
+            )
+            if defaults:
+                candidates_to_check.update(candidates)
+            tasks.extend(
+                self._schedule_room(room_id, candidates.get(room_id) if defaults else None)
+                for room_id in candidates_to_check - room_ids
+            )
+        except (AccessUnavailable, PermissionError, TimeoutError) as error:
+            if now - self._discovery_warning_at >= 60:
+                logger.warning("call activity discovery unavailable: %s", error)
+                self._discovery_warning_at = now
+        if wait_for_rooms:
+            await asyncio.gather(*tasks)
+        if collect:
+            await self.collect()
 
-        discovered = []
-        if self.config.widget_auto_transcribe_default or self.config.widget_auto_publish_default:
-            try:
-                discovered = await asyncio.wait_for(self.access.rooms(), 1.5)
-            except (AccessUnavailable, PermissionError, TimeoutError) as error:
-                if now - self._discovery_warning_at >= 60:
-                    logger.warning("automatic room discovery unavailable: %s", error)
-                    self._discovery_warning_at = now
-        discovered = {
-            r["room_id"]: r
-            for r in discovered
-            if isinstance(r, dict) and isinstance(r.get("room_id"), str)
-        }
-        room_ids = list(set(room_ids) | discovered.keys())
-        snapshots = dict(await asyncio.gather(*(snapshot(r) for r in room_ids)))
+    def _schedule_room(self, room_id, metadata=None):
+        task = self._room_tasks.get(room_id)
+        if task is None:
+            task = asyncio.create_task(self._refresh_room(room_id, metadata))
+            self._room_tasks[room_id] = task
+        return task
+
+    async def stop(self):
+        tasks = list(self._room_tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    async def _refresh_room(self, room_id, metadata):
+        try:
+            async with self._snapshot_slots:
+                room, installed = await asyncio.wait_for(
+                    self.access.snapshot(room_id, self.clock()), ROOM_STATE_TIMEOUT_S
+                )
+                await self._apply_room(room_id, metadata, room, installed)
+        except (AccessUnavailable, PermissionError, TimeoutError) as error:
+            now = self.clock()
+            if now - self._snapshot_warning_at >= 60:
+                logger.warning("call state unavailable in %s: %s", room_id, error)
+                self._snapshot_warning_at = now
+        except Exception:
+            logger.exception("updating call state in %s failed", room_id)
+        finally:
+            self._room_tasks.pop(room_id, None)
+
+    async def _apply_room(self, room_id, metadata, room, installed):
         async with self.store.transaction() as state:
-            for room_id, metadata in discovered.items():
-                if self.legacy and room_id in self.legacy.calls:
-                    continue  # Never take over a live bot-mode meeting.
-                if room_id in state["rooms"] or snapshots.get(room_id) is None:
-                    continue
-                room, installed = snapshots[room_id]
+            # Compute the lease after acquiring the store lock, never from the
+            # start of discovery or from another room's response time.
+            now = self.clock()
+            record = state["rooms"].get(room_id)
+            if record is None:
+                if metadata is None or (self.legacy and room_id in self.legacy.calls):
+                    return
                 actor = metadata.get("sender")
                 if not installed or actor not in room.members or not room.is_admin(actor):
-                    continue
-                # If the widget was installed in a call already in progress,
-                # defaults take effect at its next instance, not midway through.
+                    return
+                # Installation during an existing call applies on the next call.
                 already_live = bool(
                     room.active(int(now * 1000))
                     and getattr(room, "rtc_started_at", now) < getattr(room, "widget_added_at", 0)
                 )
-                state["rooms"][room_id] = {
+                record = state["rooms"][room_id] = {
                     "settings": {},
                     "meetings": [],
                     "call": None,
@@ -289,90 +344,77 @@ class Widget:
                     "rtc_live": already_live,
                     "rtc_empty_since": None,
                 }
-            for room_id, record in state["rooms"].items():
-                if snapshots.get(room_id) is None:
-                    continue
-                room, installed = snapshots[room_id]
+            if not installed:
+                record["auto_transcribe"] = False
+            active = room.active(int(now * 1000))
+            if not active:
+                if record.get("rtc_empty_since") is None:
+                    record["rtc_empty_since"] = now
+                if now - record["rtc_empty_since"] >= self.config.call_end_grace_s:
+                    record["rtc_live"] = False
+            else:
+                record["rtc_empty_since"] = None
+                if not record.get("rtc_live", bool(record["call"])):
+                    record["rtc_live"] = True
+                    if (
+                        installed
+                        and not room.encrypted
+                        and record.get("auto_transcribe")
+                        and record["call"] is None
+                    ):
+                        self._new_call(
+                            record, room, record["configured_by"], now, automatic=True
+                        )
+            call = record["call"]
+            if call and call.get("finishing"):
+                report = state["reports"].get(call["session_id"], {})
+                confirmed = (
+                    report.get("revision") == call["revision"]
+                    and report.get("phase") == "paused"
+                    and now - report.get("at", 0) <= REPORT_TTL_S
+                )
+                if confirmed:
+                    self._end(record, now)
+                    call = None
+                elif now >= call["finish_after"]:
+                    call["phase"] = "unknown"
+            if not call:
+                record["capture"] = None
+            if call:
+                call["audience"] = [{"id": u, "name": n} for u, n in room.members.items()]
+                active = room.active(int(now * 1000))
                 if not installed:
                     record["auto_transcribe"] = False
-                active = room.active(int(now * 1000))
-                if not active:
-                    if record.get("rtc_empty_since") is None:
-                        record["rtc_empty_since"] = now
-                    if now - record["rtc_empty_since"] >= self.config.call_end_grace_s:
-                        record["rtc_live"] = False
-                else:
-                    record["rtc_empty_since"] = None
-                    if not record.get("rtc_live", bool(record["call"])):
-                        record["rtc_live"] = True
-                        if (
-                            installed
-                            and not room.encrypted
-                            and record.get("auto_transcribe")
-                            and record["call"] is None
-                        ):
-                            self._new_call(
-                                record, room, record["configured_by"], now, automatic=True
-                            )
-                call = record["call"]
-                if call and call.get("finishing"):
-                    report = state["reports"].get(call["session_id"], {})
-                    confirmed = (
-                        report.get("revision") == call["revision"]
-                        and report.get("phase") == "paused"
-                        and now - report.get("at", 0) <= REPORT_TTL_S
-                    )
-                    if confirmed:
-                        self._end(record, now)
-                        call = None
-                    elif now >= call["finish_after"]:
-                        call["phase"] = "unknown"
-                if not call:
+                    self._end(record, now)
                     record["capture"] = None
-                if call:
-                    call["audience"] = [{"id": u, "name": n} for u, n in room.members.items()]
-                    active = room.active(int(now * 1000))
-                    if not installed:
-                        record["auto_transcribe"] = False
+                elif not active:
+                    if call["empty_since"] is None:
+                        call["empty_since"] = now
+                    if now - call["empty_since"] >= self.config.call_end_grace_s:
                         self._end(record, now)
                         record["capture"] = None
-                    elif not active:
-                        if call["empty_since"] is None:
-                            call["empty_since"] = now
-                        if now - call["empty_since"] >= self.config.call_end_grace_s:
-                            self._end(record, now)
-                            record["capture"] = None
-                    else:
-                        call["empty_since"] = None
-                    if record["call"]:
-                        for member in active:
-                            for identity in member.identities():
-                                call["members"][identity] = {
-                                    "user": member.user_id,
-                                    "name": room.name_of(member.user_id),
-                                }
-                        record["capture"] = self._capture(call, room, now)
-            state["commands"] = {
-                k: v for k, v in state["commands"].items() if now - v["at"] < 30 * 86400
-            }
-        if collect:
-            await self.collect()
+                else:
+                    call["empty_since"] = None
+                if record["call"]:
+                    for member in active:
+                        for identity in member.identities():
+                            call["members"][identity] = {
+                                "user": member.user_id,
+                                "name": room.name_of(member.user_id),
+                            }
+                    record["capture"] = self._capture(call, room, now)
 
     async def collect(self):
         # Gateway/download latency must never hold the command/capture lease lock.
         async with self.store.transaction() as state:
             records = copy.deepcopy(state["rooms"])
         for room_id, record in records.items():
-            try:
-                room, installed = await self.access.snapshot(room_id, self.clock())
-            except (AccessUnavailable, PermissionError):
-                continue
             call = record.get("call")
             if call:
                 await self.gateway.audience(call["session_id"], call["audience"])
             for original in record["meetings"]:
                 updated = copy.deepcopy(original)
-                await self._collect(updated, room, installed, self.clock())
+                await self._collect(updated, self.clock())
                 async with self.store.transaction() as state:
                     meetings = state["rooms"][room_id]["meetings"]
                     for index, current in enumerate(meetings):
@@ -416,6 +458,23 @@ class Widget:
         async with self.store.transaction() as state:
             return set(state["rooms"])
 
+    async def unconfirmed_calls(self):
+        now = self.clock()
+        async with self.store.transaction() as state:
+            count = 0
+            for record in state["rooms"].values():
+                call = record.get("call")
+                if not call or not call["recording"] or not call.get("automatic"):
+                    continue
+                report = state["reports"].get(call["session_id"], {})
+                if now - call["started_at"] >= CAPTURE_START_GRACE_S and (
+                    report.get("revision") != call["revision"]
+                    or report.get("phase") != "transcribing"
+                    or now - report.get("at", 0) > REPORT_TTL_S
+                ):
+                    count += 1
+            return count
+
     async def report(self, reports):
         async with self.store.transaction() as state:
             for report in reports[:100]:
@@ -448,7 +507,7 @@ class Widget:
                 return base64.b64decode(artifact["content"])
         return await self.store.artifact(room_id, sid, kind)
 
-    async def _collect(self, meeting, room, installed, now):
+    async def _collect(self, meeting, now):
         sid = meeting["session_id"]
         try:
             await self.gateway.audience(sid, meeting["audience"])

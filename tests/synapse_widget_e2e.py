@@ -93,6 +93,22 @@ assert (
     == 2
 )
 assert any(e.get("state_key") == "voxonta" for e in ok("GET", path + "/state", token=at))
+activity = {"action": "activity"}
+assert req("POST", ADAPTER, activity)[0] == 403
+assert room in ok("POST", ADAPTER, activity, T)["installed"]
+assert room not in {r["room_id"] for r in ok("POST", ADAPTER, activity, T)["rooms"]}
+legacy = {
+    "application": "m.call",
+    "scope": "m.room",
+    "device_id": "LAPTOP",
+    "focus_active": {"type": "livekit"},
+    "expires": 60000,
+}
+membership_path = path + "/state/org.matrix.msc3401.call.member/probe-device"
+ok("PUT", membership_path, legacy, at)
+assert room in {r["room_id"] for r in ok("POST", ADAPTER, activity, T)["rooms"]}
+ok("PUT", membership_path, {}, at)
+assert room not in {r["room_id"] for r in ok("POST", ADAPTER, activity, T)["rooms"]}
 # Native sticky RTC: the adapter must persist it for snapshots and restarts.
 rtc = {
     "slot_id": "m.call#ROOM",
@@ -110,6 +126,7 @@ for _ in range(20):
         break
     time.sleep(0.1)
 assert any(e["event_id"] == rtc_event["event_id"] for e in snapshot["rtc"])
+assert room in {r["room_id"] for r in ok("POST", ADAPTER, activity, T)["rooms"]}
 publication = {
     "action": "publish",
     "room_id": room,

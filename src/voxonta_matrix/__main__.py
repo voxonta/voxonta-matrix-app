@@ -121,7 +121,7 @@ async def run(config: Config) -> None:
         if widget:
 
             async def refresh_widget():
-                await widget.tick(collect=False)
+                await widget.tick(collect=False, wait_for_rooms=False)
 
             timers.append(asyncio.create_task(_every(1, refresh_widget, "widget meetings", stop)))
             timers.append(
@@ -133,6 +133,9 @@ async def run(config: Config) -> None:
         logger.info("stopping")
         for timer in timers:
             timer.cancel()
+        await asyncio.gather(*timers, return_exceptions=True)
+        if widget:
+            await widget.stop()
         for runner in runners:
             await runner.cleanup()
     await store.close()
