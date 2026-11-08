@@ -1,9 +1,11 @@
 import asyncio
+import copy
 
 import pytest
 from conftest import ROOM, device
 from test_widget import ALICE, BOB, finish, setup
 
+from voxonta_matrix.room_access import AccessUnavailable
 from voxonta_matrix.widget import Widget
 
 
@@ -94,6 +96,117 @@ def test_reconnect_and_backend_restart_keep_one_automatic_meeting():
     asyncio.run(go())
 
 
+def test_discovery_uses_only_call_candidates_and_retries_after_an_outage():
+    async def go():
+        s = setup()
+        s.w.config.widget_auto_transcribe_default = True
+        leave_call(s)
+        await s.w.command(ROOM, ALICE, "auto_transcribe", "enable", True)
+        idle_rooms = {f"!idle{i}:example.org" for i in range(917)}
+        async with s.db.transaction() as state:
+            for room_id in idle_rooms:
+                state["rooms"][room_id] = {"auto_transcribe": True, "meetings": []}
+        snapshots = []
+        original = s.access.snapshot
+        activity = s.access.activity
+        fail = False
+
+        async def with_idle_rooms():
+            installed, candidates = await activity()
+            return installed | idle_rooms, candidates
+
+        async def snapshot(room_id, now):
+            snapshots.append(room_id)
+            if fail:
+                raise AccessUnavailable("offline")
+            return await original(room_id, now)
+
+        s.access.activity = with_idle_rooms
+        s.access.snapshot = snapshot
+        await s.w.tick()
+        assert snapshots == []
+
+        join_call(s)
+        fail = True
+        await s.w.tick()
+        assert snapshots == [ROOM]
+        assert not await s.w.calls_listing()
+
+        fail = False
+        s.w = Widget(s.w.config, s.db, s.access, s.gw, clock=s.clock)
+        await s.w.tick()
+        calls = await s.w.calls_listing()
+        assert len(calls) == 1
+        await s.w.tick()
+        assert (await s.w.calls_listing())[0]["session_id"] == calls[0]["session_id"]
+        assert set(snapshots) == {ROOM}
+        assert await s.w.unconfirmed_calls() == 0
+        s.clock.now += 16
+        assert await s.w.unconfirmed_calls() == 1
+        await s.w.report(
+            [
+                {
+                    "session_id": calls[0]["session_id"],
+                    "phase": "transcribing",
+                    "revision": calls[0]["revision"],
+                }
+            ]
+        )
+        assert await s.w.unconfirmed_calls() == 0
+
+    asyncio.run(go())
+
+
+def test_slow_room_does_not_delay_other_lease_or_next_poll():
+    async def go():
+        s = setup()
+        s.w.config.widget_auto_transcribe_default = True
+        slow = "!slow:example.org"
+        original = s.access.snapshot
+        release_slow = asyncio.Event()
+        blocked = asyncio.Event()
+        stall = False
+
+        async def activity():
+            return {ROOM, slow}, [
+                {"room_id": room_id, "sender": ALICE} for room_id in (ROOM, slow)
+            ]
+
+        async def snapshot(room_id, now):
+            if stall and room_id == slow:
+                blocked.set()
+                await release_slow.wait()
+            room, installed = await original(room_id, now)
+            room = copy.deepcopy(room)
+            room.room_id = room_id
+            return room, installed
+
+        s.access.activity, s.access.snapshot = activity, snapshot
+        await s.w.tick(collect=False)
+        initial = {c["token"]: c for c in await s.w.calls_listing()}
+        assert set(initial) == {ROOM, slow}
+        stall = True
+        try:
+            for _ in range(2):
+                s.clock.now += 3
+                await s.w.tick(collect=False, wait_for_rooms=False)
+                await asyncio.wait_for(blocked.wait(), 0.5)
+                task = s.w._room_tasks.get(ROOM)
+                if task:
+                    await asyncio.wait_for(task, 0.5)
+                calls = {c["token"]: c for c in await s.w.calls_listing()}
+                assert calls[ROOM]["lease_until"] > s.clock()
+                assert calls[ROOM]["session_id"] == initial[ROOM]["session_id"]
+                assert calls[slow]["lease_until"] == initial[slow]["lease_until"]
+                assert slow in s.w._room_tasks
+            assert calls[slow]["lease_until"] < s.clock()
+        finally:
+            release_slow.set()
+            await s.w.stop()
+
+    asyncio.run(go())
+
+
 @pytest.mark.parametrize("action", ["auto_transcribe", "settings"])
 def test_only_room_admin_can_change_room_policy(action):
     async def go():
@@ -165,7 +278,7 @@ def test_widget_removal_disables_automation_and_does_not_reapply_defaults():
         s = setup()
         s.w.config.widget_auto_transcribe_default = True
         leave_call(s)
-        await s.w.tick()
+        await s.w.command(ROOM, ALICE, "auto_transcribe", "enable", True)
         s.access.installed = False
         await s.w.tick()
         s.access.installed = True

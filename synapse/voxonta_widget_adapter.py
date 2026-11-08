@@ -29,6 +29,9 @@ TYPES = {
     "org.matrix.msc3401.call.member",
 }
 RTC = {"m.rtc.member", "org.matrix.msc4143.rtc.member"}
+LEGACY_MEMBER = "org.matrix.msc3401.call.member"
+STICKY_HISTORY_MS = 3600000
+LEGACY_DEFAULT_EXPIRES_MS = 4 * STICKY_HISTORY_MS
 
 
 class VoxontaWidgetAdapter:
@@ -174,6 +177,50 @@ class VoxontaWidgetAdapter:
             )
 
         await self.api.run_db_interaction("voxonta_rtc", save)
+
+    async def activity(self):
+        """Find candidate rooms from persisted RTC events, including after restart."""
+        installed = {r["room_id"]: r for r in await self.rooms()}
+        now = int(time.time() * 1000)
+
+        def read(txn):
+            # Legacy memberships are Synapse state. Reading current events also
+            # covers calls that started before this adapter was upgraded.
+            txn.execute(
+                "SELECT s.room_id, e.json FROM current_state_events s "
+                "JOIN voxonta_widget_rooms w ON w.room_id=s.room_id "
+                "JOIN event_json e ON e.event_id=s.event_id WHERE s.type=?",
+                (LEGACY_MEMBER,),
+            )
+            candidates = set()
+            for room_id, body in txn.fetchall():
+                event = json.loads(body)
+                content = event.get("content") or {}
+                if not isinstance(content, dict) or not content:
+                    continue
+                try:
+                    started = int(content.get("created_ts") or event.get("origin_server_ts") or 0)
+                    expires = int(content.get("expires") or LEGACY_DEFAULT_EXPIRES_MS)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if started + expires > now:
+                    candidates.add(room_id)
+
+            # Sticky events are not room state. The snapshot parser resolves
+            # leaves, expiry and ordering from the same retained history.
+            txn.execute(
+                "SELECT DISTINCT r.room_id FROM voxonta_widget_rtc r "
+                "JOIN voxonta_widget_rooms w ON w.room_id=r.room_id WHERE r.ts>=?",
+                (now - STICKY_HISTORY_MS,),
+            )
+            candidates.update(row[0] for row in txn.fetchall())
+            return candidates
+
+        candidates = await self.api.run_db_interaction("voxonta_room_activity", read)
+        return {
+            "installed": sorted(installed),
+            "rooms": [installed[r] for r in sorted(candidates) if r in installed],
+        }
 
     async def snapshot(self, room_id):
         state = await self.api.get_room_state(room_id)
@@ -337,6 +384,8 @@ class Endpoint(DirectServeJsonResource):
         body = parse_json_object_from_request(request)
         if body.get("action") == "rooms":
             return 200, {"rooms": await self.adapter.rooms()}
+        if body.get("action") == "activity":
+            return 200, await self.adapter.activity()
         room_id = body.get("room_id")
         if not isinstance(room_id, str) or not room_id.startswith("!") or len(room_id) > 255:
             raise SynapseError(400, "invalid room")

@@ -29,10 +29,15 @@ class Access:
         self.down = False
         self.sent = {}
 
-    async def rooms(self):
+    async def activity(self):
         if self.down:
             raise AccessUnavailable("offline")
-        return [{"room_id": ROOM, "sender": ALICE}] if self.installed else []
+        if not self.installed:
+            return set(), []
+        candidates = (
+            [{"room_id": ROOM, "sender": ALICE}] if (self.room.memberships or self.room.rtc) else []
+        )
+        return {ROOM}, candidates
 
     async def snapshot(self, room, now):
         if self.down:
